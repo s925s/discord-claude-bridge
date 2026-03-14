@@ -21,6 +21,7 @@ FORUM_CHANNEL_ID = int(os.getenv("FORUM_CHANNEL_ID", "0"))
 LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "0"))
 GUILD_ID = int(os.getenv("GUILD_ID", "0"))
 ALLOWED_USERS = set(os.getenv("ALLOWED_USERS", "").split(","))
+SKIP_PERMISSIONS = os.getenv("SKIP_PERMISSIONS", "false").lower() in ("true", "1", "yes")
 
 SESSIONS_FILE = Path(__file__).parent / "sessions.json"
 SOFT_TIMEOUT = 600   # 10分で「まだやってるよ」メッセージ
@@ -82,7 +83,9 @@ def parse_claude_output(raw: str, err: str, session_id: str | None) -> tuple[str
 async def run_claude(prompt: str, session_id: str | None = None, thread: discord.Thread | None = None, thread_title: str | None = None) -> tuple[str, str | None]:
     """Claude Code CLI を実行して (応答テキスト, セッションID) を返す。
     ソフトタイムアウト時はスレッドにメッセージを送り、完了後に編集する。"""
-    args = ["claude", "--dangerously-skip-permissions", "-p", "--output-format", "json"]
+    args = ["claude", "-p", "--output-format", "json"]
+    if SKIP_PERMISSIONS:
+        args.insert(1, "--dangerously-skip-permissions")
     if session_id:
         args.extend(["--resume", session_id])
     # 新規セッション時はスレッドタイトルをコンテキストとして付加
