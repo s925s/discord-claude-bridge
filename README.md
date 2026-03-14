@@ -1,5 +1,7 @@
 <div align="center">
 
+**日本語** | [English](README_en.md) | [中文](README_zh.md)
+
 # Discord Claude Bridge
 
 ### Discordフォーラム × Claude Code CLI
