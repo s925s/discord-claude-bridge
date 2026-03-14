@@ -1,5 +1,11 @@
 # Discord Claude Bridge
 
+![Python](https://img.shields.io/badge/Python-3.11+-3776AB?logo=python&logoColor=white)
+![discord.py](https://img.shields.io/badge/discord.py-2.3+-5865F2?logo=discord&logoColor=white)
+![Claude Code](https://img.shields.io/badge/Claude_Code-CLI-D97757?logo=anthropic&logoColor=white)
+![License](https://img.shields.io/badge/License-MIT-green)
+![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey)
+
 Discordのフォーラムチャンネルから [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI を呼び出せるブリッジBotです。
 フォーラムスレッドがそのままClaude Codeとの会話セッションになります。
 
