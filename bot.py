@@ -3,6 +3,7 @@ import sys
 import json
 import asyncio
 import re
+import uuid
 from pathlib import Path
 from datetime import datetime
 
@@ -13,6 +14,7 @@ sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
+from aiohttp import web
 
 load_dotenv()
 
@@ -22,6 +24,7 @@ LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "0"))
 GUILD_ID = int(os.getenv("GUILD_ID", "0"))
 ALLOWED_USERS = set(os.getenv("ALLOWED_USERS", "").split(","))
 SKIP_PERMISSIONS = os.getenv("SKIP_PERMISSIONS", "false").lower() in ("true", "1", "yes")
+HOOK_PORT = int(os.getenv("HOOK_PORT", "8585"))
 
 SESSIONS_FILE = Path(__file__).parent / "sessions.json"
 SOFT_TIMEOUT = 600   # 10分で「まだやってるよ」メッセージ
@@ -33,6 +36,163 @@ TAG_COMPLETED = "完了"
 TAG_ERROR = "エラー"
 
 
+# ==============================
+# 権限管理
+# ==============================
+
+# request_id → asyncio.Event (ボタン押下待ち)
+permission_events: dict[str, asyncio.Event] = {}
+# request_id → フックに返す結果
+permission_results: dict[str, dict] = {}
+# thread_id → 「常に許可」されたツール名のセット
+allowed_tools: dict[str, set[str]] = {}
+
+
+def format_tool_detail(tool_name: str, tool_input: dict) -> str:
+    """ツール情報を Discord 表示用にフォーマット"""
+    if tool_name == "Bash":
+        cmd = tool_input.get("command", "")
+        return f"```bash\n{cmd[:800]}\n```"
+    elif tool_name in ("Edit", "Write", "MultiEdit"):
+        path = tool_input.get("file_path", "")
+        old = tool_input.get("old_string", "")
+        new = tool_input.get("new_string", "")
+        parts = [f"**ファイル:** `{path}`"]
+        if old:
+            parts.append(f"```diff\n- {old[:200]}\n+ {new[:200]}\n```")
+        return "\n".join(parts)
+    elif tool_name == "NotebookEdit":
+        path = tool_input.get("notebook_path", tool_input.get("file_path", ""))
+        return f"**ノートブック:** `{path}`"
+    else:
+        # MCP ツール等
+        detail = json.dumps(tool_input, ensure_ascii=False, indent=2)
+        if len(detail) > 500:
+            detail = detail[:500] + "\n..."
+        return f"```json\n{detail}\n```"
+
+
+class PermissionView(discord.ui.View):
+    """許可 / 常に許可 / 拒否 ボタン"""
+
+    def __init__(self, request_id: str, tool_name: str, thread_id: str):
+        super().__init__(timeout=600)
+        self.request_id = request_id
+        self.tool_name = tool_name
+        self.thread_id = thread_id
+
+    def _resolve(self, result: dict):
+        permission_results[self.request_id] = result
+        ev = permission_events.get(self.request_id)
+        if ev:
+            ev.set()
+
+    @discord.ui.button(label="許可", style=discord.ButtonStyle.green, emoji="✅")
+    async def allow_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self._resolve({})
+        self.stop()
+        await interaction.response.edit_message(
+            content=f"✅ `{self.tool_name}` を許可しました", view=None,
+        )
+
+    @discord.ui.button(label="常に許可", style=discord.ButtonStyle.blurple, emoji="🔓")
+    async def always_allow_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        allowed_tools.setdefault(self.thread_id, set()).add(self.tool_name)
+        self._resolve({})
+        self.stop()
+        await interaction.response.edit_message(
+            content=f"🔓 `{self.tool_name}` を常に許可しました（このスレッド内）", view=None,
+        )
+
+    @discord.ui.button(label="拒否", style=discord.ButtonStyle.red, emoji="❌")
+    async def deny_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self._resolve({"decision": "block", "reason": "Discordユーザーが拒否しました"})
+        self.stop()
+        await interaction.response.edit_message(
+            content=f"❌ `{self.tool_name}` を拒否しました", view=None,
+        )
+
+    async def on_timeout(self):
+        # タイムアウト時は許可（ブロックしない）
+        if self.request_id in permission_events:
+            self._resolve({})
+
+
+async def handle_permission_request(request: web.Request) -> web.Response:
+    """hook_pretooluse.py からの HTTP リクエストを処理"""
+    data = await request.json()
+    tool_name = data.get("tool_name", "unknown")
+    tool_input = data.get("tool_input", {})
+    thread_id = data.get("thread_id", "")
+
+    # 「常に許可」済みのツールは即応答
+    if thread_id in allowed_tools and tool_name in allowed_tools[thread_id]:
+        return web.json_response({})
+
+    # Discord にボタン送信
+    request_id = str(uuid.uuid4())
+    event = asyncio.Event()
+    permission_events[request_id] = event
+
+    try:
+        thread = bot.get_channel(int(thread_id)) if thread_id else None
+        if thread:
+            detail = format_tool_detail(tool_name, tool_input)
+            view = PermissionView(request_id, tool_name, thread_id)
+            await thread.send(
+                f"🔐 **権限リクエスト: `{tool_name}`**\n{detail}",
+                view=view,
+            )
+    except Exception as e:
+        print(f"権限リクエスト送信エラー: {e}")
+        # 送信失敗時は許可
+        return web.json_response({})
+
+    # ユーザーの応答を待つ（最大10分）
+    try:
+        await asyncio.wait_for(event.wait(), timeout=600)
+    except asyncio.TimeoutError:
+        pass
+
+    result = permission_results.pop(request_id, {})
+    permission_events.pop(request_id, None)
+    return web.json_response(result)
+
+
+async def start_hook_server():
+    """フックからのリクエストを受けるローカル HTTP サーバーを起動"""
+    app = web.Application()
+    app.router.add_post("/permission", handle_permission_request)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", HOOK_PORT)
+    await site.start()
+    print(f"Hook サーバー起動: http://127.0.0.1:{HOOK_PORT}")
+
+
+def build_hook_settings() -> str:
+    """Claude Code に渡す hooks 設定 JSON ファイルを生成して返す"""
+    hook_script = str(Path(__file__).parent / "hook_pretooluse.py")
+    settings = {
+        "hooks": {
+            "PreToolUse": [{
+                "hooks": [{
+                    "type": "command",
+                    "command": f'"{sys.executable}" "{hook_script}"',
+                    "timeout": 600,
+                }],
+            }],
+        },
+    }
+    settings_path = Path(__file__).parent / ".claude_hook_settings.json"
+    settings_path.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+    return str(settings_path)
+
+
+# ==============================
+# セッション管理
+# ==============================
+
 def load_sessions() -> dict:
     if SESSIONS_FILE.exists():
         return json.loads(SESSIONS_FILE.read_text(encoding="utf-8"))
@@ -42,6 +202,10 @@ def load_sessions() -> dict:
 def save_sessions(sessions: dict):
     SESSIONS_FILE.write_text(json.dumps(sessions, indent=2), encoding="utf-8")
 
+
+# ==============================
+# Claude Code 実行
+# ==============================
 
 def strip_ansi(text: str) -> str:
     return re.sub(r"\x1B\[[0-9;]*[a-zA-Z]", "", text)
@@ -66,7 +230,6 @@ def parse_claude_output(raw: str, err: str, session_id: str | None) -> tuple[str
             output = "\n".join(texts)
         else:
             output = str(result)
-        # resultが空でもJSON全体にテキストがあればフォールバック
         if not output:
             output = data.get("text", "") or json.dumps(data, ensure_ascii=False, indent=2)
     except json.JSONDecodeError:
@@ -80,15 +243,27 @@ def parse_claude_output(raw: str, err: str, session_id: str | None) -> tuple[str
     return output.strip(), new_session_id
 
 
-async def run_claude(prompt: str, session_id: str | None = None, thread: discord.Thread | None = None, thread_title: str | None = None) -> tuple[str, str | None]:
-    """Claude Code CLI を実行して (応答テキスト, セッションID) を返す。
-    ソフトタイムアウト時はスレッドにメッセージを送り、完了後に編集する。"""
+async def run_claude(
+    prompt: str,
+    session_id: str | None = None,
+    thread: discord.Thread | None = None,
+    thread_title: str | None = None,
+) -> tuple[str, str | None]:
+    """Claude Code CLI を実行して (応答テキスト, セッションID) を返す。"""
     args = ["claude", "-p", "--output-format", "json"]
+
     if SKIP_PERMISSIONS:
+        # 全権限スキップ（フックなし）
         args.insert(1, "--dangerously-skip-permissions")
+    else:
+        # フックで権限管理（built-in プロンプトは無効化）
+        args.insert(1, "--dangerously-skip-permissions")
+        settings_path = build_hook_settings()
+        args.extend(["--settings", settings_path])
+
     if session_id:
         args.extend(["--resume", session_id])
-    # 新規セッション時はスレッドタイトルをコンテキストとして付加
+
     if not session_id and thread_title:
         prompt = f"[スレッドタイトル: {thread_title}]\n\n{prompt}"
     args.append(prompt)
@@ -96,6 +271,9 @@ async def run_claude(prompt: str, session_id: str | None = None, thread: discord
     env = os.environ.copy()
     env.pop("CLAUDECODE", None)
     env["PYTHONIOENCODING"] = "utf-8"
+    env["HOOK_PORT"] = str(HOOK_PORT)
+    if thread:
+        env["DISCORD_THREAD_ID"] = str(thread.id)
 
     proc = await asyncio.create_subprocess_exec(
         *args,
@@ -104,11 +282,10 @@ async def run_claude(prompt: str, session_id: str | None = None, thread: discord
         env=env,
     )
 
-    # まずソフトタイムアウトで待つ
+    # ソフトタイムアウトで待つ
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=SOFT_TIMEOUT)
     except asyncio.TimeoutError:
-        # まだ動いてる → メッセージ送って待ち続ける
         elapsed = SOFT_TIMEOUT // 60
         placeholder = None
         if thread:
@@ -116,7 +293,7 @@ async def run_claude(prompt: str, session_id: str | None = None, thread: discord
 
         try:
             stdout, stderr = await asyncio.wait_for(
-                proc.communicate(), timeout=HARD_TIMEOUT - SOFT_TIMEOUT
+                proc.communicate(), timeout=HARD_TIMEOUT - SOFT_TIMEOUT,
             )
         except asyncio.TimeoutError:
             proc.kill()
@@ -129,14 +306,12 @@ async def run_claude(prompt: str, session_id: str | None = None, thread: discord
         err = stderr.decode("utf-8", errors="replace").strip()
         output, new_session_id = parse_claude_output(raw, err, session_id)
 
-        # プレースホルダーを結果で編集
         if placeholder:
             chunks = split_message(output, 2000)
             await placeholder.edit(content=chunks[0])
-            # 2000文字超えてたら残りは追加送信
             for chunk in chunks[1:]:
                 await thread.send(chunk)
-            return None, new_session_id  # Noneで「もう送信済み」を示す
+            return None, new_session_id
 
         return output, new_session_id
 
@@ -145,17 +320,16 @@ async def run_claude(prompt: str, session_id: str | None = None, thread: discord
     return parse_claude_output(raw, err, session_id)
 
 
-# --- タグ管理 ---
+# ==============================
+# タグ管理
+# ==============================
 
 async def get_or_create_tag(forum: discord.ForumChannel, name: str) -> discord.ForumTag:
-    """フォーラムタグを取得、なければ作成"""
     for tag in forum.available_tags:
         if tag.name == name:
             return tag
-    # タグ作成
     new_tags = list(forum.available_tags) + [discord.ForumTag(name=name)]
     await forum.edit(available_tags=new_tags)
-    # 再取得
     forum = await forum.guild.fetch_channel(forum.id)
     for tag in forum.available_tags:
         if tag.name == name:
@@ -164,27 +338,25 @@ async def get_or_create_tag(forum: discord.ForumChannel, name: str) -> discord.F
 
 
 async def set_thread_tag(thread: discord.Thread, tag_name: str):
-    """スレッドのタグを指定のものだけにする"""
     try:
         forum = thread.parent
         if not forum:
             forum = await thread.guild.fetch_channel(thread.parent_id)
-
         tag = await get_or_create_tag(forum, tag_name)
         if tag:
-            # 他のステータスタグを除去して新しいのだけセット
             status_names = {TAG_RUNNING, TAG_COMPLETED, TAG_ERROR}
             keep_tags = [t for t in thread.applied_tags if t.name not in status_names]
             keep_tags.append(tag)
-            await thread.edit(applied_tags=keep_tags[:5])  # Discord上限5個
+            await thread.edit(applied_tags=keep_tags[:5])
     except Exception as e:
         print(f"タグ設定エラー: {e}")
 
 
-# --- ログ ---
+# ==============================
+# ログ
+# ==============================
 
 async def send_log(guild: discord.Guild, user: str, thread_name: str, prompt: str, result: str, status: str):
-    """ログチャンネルに記録を送信"""
     if not LOG_CHANNEL_ID:
         return
     try:
@@ -205,7 +377,6 @@ async def send_log(guild: discord.Guild, user: str, thread_name: str, prompt: st
         embed.add_field(name="ユーザー", value=user, inline=True)
         embed.add_field(name="時刻", value=now, inline=True)
         embed.add_field(name="プロンプト", value=prompt[:1024], inline=False)
-        # 結果は長すぎる場合があるので切り詰め
         if result:
             embed.add_field(name="応答", value=result[:1024], inline=False)
         await log_ch.send(embed=embed)
@@ -213,22 +384,20 @@ async def send_log(guild: discord.Guild, user: str, thread_name: str, prompt: st
         print(f"ログ送信エラー: {e}")
 
 
-# --- メッセージ分割送信 ---
+# ==============================
+# メッセージ分割送信
+# ==============================
 
 async def send_response(channel: discord.Thread, text: str):
-    """Markdown対応で2000文字分割送信"""
     if not text:
         await channel.send("（空の応答）")
         return
-
-    # 2000文字ずつに分割（コードブロックの途中で切れないよう考慮）
     chunks = split_message(text, 2000)
     for chunk in chunks:
         await channel.send(chunk)
 
 
 def split_message(text: str, limit: int = 2000) -> list[str]:
-    """メッセージを制限内で分割。コードブロック内なら閉じて次で開く"""
     if len(text) <= limit:
         return [text]
 
@@ -238,7 +407,6 @@ def split_message(text: str, limit: int = 2000) -> list[str]:
             chunks.append(text)
             break
 
-        # 改行位置で切る
         cut = text.rfind("\n", 0, limit)
         if cut == -1 or cut < limit // 2:
             cut = limit
@@ -246,10 +414,8 @@ def split_message(text: str, limit: int = 2000) -> list[str]:
         chunk = text[:cut]
         text = text[cut:].lstrip("\n")
 
-        # コードブロックの開閉チェック
         backtick_count = chunk.count("```")
         if backtick_count % 2 == 1:
-            # 開いたまま → 閉じる＆次で開く
             chunk += "\n```"
             text = "```\n" + text
 
@@ -258,13 +424,14 @@ def split_message(text: str, limit: int = 2000) -> list[str]:
     return chunks
 
 
-# --- Bot setup ---
+# ==============================
+# Bot setup
+# ==============================
 
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# 同時実行制御
 queue = asyncio.Queue()
 processing = False
 
@@ -280,7 +447,6 @@ async def process_queue():
             status = TAG_RUNNING
             result = ""
             try:
-                # タグ: 実行中
                 await set_thread_tag(thread, TAG_RUNNING)
                 await send_log(
                     thread.guild, str(message.author),
@@ -295,7 +461,6 @@ async def process_queue():
                         sessions[str(thread.id)] = new_session_id
                         save_sessions(sessions)
 
-                    # result=None はrun_claude内で送信済み
                     if result is not None:
                         await send_response(thread, result)
                     status = TAG_COMPLETED
@@ -305,7 +470,6 @@ async def process_queue():
                 status = TAG_ERROR
                 await thread.send(f"エラーが発生しました: {e}")
             finally:
-                # タグ: 完了 or エラー
                 await set_thread_tag(thread, status)
                 await send_log(
                     thread.guild, str(message.author),
@@ -318,23 +482,23 @@ async def process_queue():
 
 @bot.event
 async def on_ready():
+    if not SKIP_PERMISSIONS:
+        await start_hook_server()
     print(f"Bot起動: {bot.user}")
     print(f"フォーラムチャンネルID: {FORUM_CHANNEL_ID}")
     print(f"ログチャンネルID: {LOG_CHANNEL_ID}")
     print(f"許可ユーザー: {ALLOWED_USERS}")
+    print(f"権限モード: {'全スキップ' if SKIP_PERMISSIONS else f'Discord承認 (port {HOOK_PORT})'}")
 
 
 @bot.event
 async def on_message(message: discord.Message):
-    """フォーラムスレッド内のメッセージ → Claude Code実行"""
     if message.author.bot:
         return
-
     if not isinstance(message.channel, discord.Thread):
         return
     if message.channel.parent_id != FORUM_CHANNEL_ID:
         return
-
     if str(message.author.id) not in ALLOWED_USERS:
         return
 

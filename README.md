@@ -39,6 +39,7 @@ graph LR
 | 機能 | 説明 |
 |:---:|---|
 | **セッション管理** | スレッドごとにClaude Codeセッションを自動管理。`--resume` で会話を継続 |
+| **Discord権限承認** | Claude Codeのツール実行前にDiscordボタンで許可/拒否を選択可能 |
 | **タグ自動更新** | `実行中` / `完了` / `エラー` タグがリアルタイムで切り替わる |
 | **実行ログ** | 全実行のプロンプト・応答・ステータスをEmbed形式で別チャンネルに記録 |
 | **タイムアウト制御** | 10分で進捗通知、1時間で強制終了。長時間タスクも安心 |
@@ -76,7 +77,8 @@ cp .env.example .env
 | `FORUM_CHANNEL_ID` | プロンプトを受け付けるフォーラムチャンネルのID |
 | `LOG_CHANNEL_ID` | 実行ログを送信するチャンネルのID |
 | `GUILD_ID` | BotがいるサーバーのID |
-| `SKIP_PERMISSIONS` | `true` で Claude Code の権限チェックをスキップ（デフォルト: `false`） |
+| `SKIP_PERMISSIONS` | `true` で全操作を自動許可（デフォルト: `false`） |
+| `HOOK_PORT` | 権限リクエスト用の内部ポート（デフォルト: `8585`） |
 
 ### 3. Discord Botの準備
 
@@ -103,15 +105,41 @@ python bot.py
 
 > スレッドタイトルは新規セッション時のコンテキストとして自動的に付加されます。
 
+## Permission Mode
+
+`SKIP_PERMISSIONS=false`（デフォルト）の場合、Claude Code がファイル編集やコマンド実行などのツールを使おうとすると、Discordスレッドにボタンが表示されます。
+
+```mermaid
+sequenceDiagram
+    participant CC as Claude Code
+    participant Hook as PreToolUse Hook
+    participant Bot as Bridge Bot
+    participant D as Discord
+
+    CC->>Hook: ツール実行リクエスト
+    Hook->>Bot: HTTP POST /permission
+    Bot->>D: ボタン送信（許可/常に許可/拒否）
+    D->>Bot: ユーザーがクリック
+    Bot->>Hook: 結果を返却
+    Hook->>CC: 許可 or ブロック
+```
+
+| ボタン | 動作 |
+|:---:|---|
+| **許可** | 今回のツール実行のみ許可 |
+| **常に許可** | そのスレッド内で同じツールを以後自動許可 |
+| **拒否** | ツール実行をブロック |
+
+> 読み取り専用ツール（`Read`, `Glob`, `Grep` 等）は自動的に許可されます。
+
 ## Security
 
 > **Warning**
-> `SKIP_PERMISSIONS=true` を設定すると、Claude Code が `--dangerously-skip-permissions` モードで実行されます。
-> このモードではファイルの読み書き・コマンド実行が**確認なしで**行われます。
+> `SKIP_PERMISSIONS=true` を設定すると、全操作が**確認なしで**実行されます。
 >
 > - 必ず `ALLOWED_USERS` を信頼できるユーザーのみに限定してください
 > - Botを動かすマシン上で実行されるため、そのマシンへのアクセス権と同等のリスクがあります
-> - デフォルトは `false`（無効）です。通常モードではClaude Code側の権限確認が機能します
+> - デフォルトの `false` では、Discord上でツールごとに許可/拒否を選択できます
 
 ## License
 

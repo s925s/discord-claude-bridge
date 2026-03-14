@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 *.bat
 twitter_media.py
+.claude_hook_settings.json
