@@ -23,6 +23,14 @@ env/
 .coverage
 *.log
 
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
 # Project-specific exclusions
 *.bat
 twitter_media.py

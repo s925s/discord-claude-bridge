@@ -206,8 +206,11 @@ async def handle_permission_request(request: web.Request) -> web.Response:
     except asyncio.TimeoutError:
         pass
 
-    result = permission_results.pop(request_id, {})
+    result = permission_results.pop(request_id, None)
     permission_events.pop(request_id, None)
+    # タイムアウト等で結果が無い場合は正しいフォーマットで許可を返す
+    if result is None:
+        result = make_quick_allow(hook_type)
     return web.json_response(result)
 
 
