@@ -197,7 +197,9 @@ async def handle_permission_request(request: web.Request) -> web.Response:
             )
     except Exception as e:
         print(f"権限リクエスト送信エラー: {e}")
-        # 送信失敗時は許可
+        # 送信失敗時はクリーンアップして許可
+        permission_events.pop(request_id, None)
+        permission_results.pop(request_id, None)
         return web.json_response(make_quick_allow(hook_type))
 
     # ユーザーの応答を待つ（最大10分）
@@ -227,7 +229,7 @@ async def start_hook_server():
 
 def build_hook_settings() -> str:
     """Claude Code に渡す hooks 設定 JSON ファイルを生成して返す"""
-    base_dir = Path(__file__).parent
+    base_dir = Path(__file__).parent.resolve()
     pretooluse_script = str(base_dir / "hook_pretooluse.py")
     permission_script = str(base_dir / "hook_permission_request.py")
     settings = {
@@ -365,6 +367,10 @@ async def run_claude(
             )
         except asyncio.TimeoutError:
             proc.kill()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                pass
             msg = f"タイムアウトしました（{HARD_TIMEOUT // 60}分超過、強制終了）"
             if placeholder:
                 await placeholder.edit(content=msg)
