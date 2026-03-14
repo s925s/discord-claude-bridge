@@ -22,7 +22,7 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 FORUM_CHANNEL_ID = int(os.getenv("FORUM_CHANNEL_ID", "0"))
 LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "0"))
 GUILD_ID = int(os.getenv("GUILD_ID", "0"))
-ALLOWED_USERS = set(filter(None, os.getenv("ALLOWED_USERS", "").split(",")))
+ALLOWED_USERS = set(filter(None, (x.strip() for x in os.getenv("ALLOWED_USERS", "").split(","))))
 SKIP_PERMISSIONS = os.getenv("SKIP_PERMISSIONS", "false").lower() in ("true", "1", "yes")
 HOOK_PORT = int(os.getenv("HOOK_PORT", "8585"))
 
@@ -256,7 +256,10 @@ def build_hook_settings() -> str:
 
 def load_sessions() -> dict:
     if SESSIONS_FILE.exists():
-        return json.loads(SESSIONS_FILE.read_text(encoding="utf-8"))
+        try:
+            return json.loads(SESSIONS_FILE.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            print(f"警告: {SESSIONS_FILE} が破損しています。空のセッションで開始します")
     return {}
 
 
@@ -338,6 +341,7 @@ async def run_claude(
 
     proc = await asyncio.create_subprocess_exec(
         *args,
+        stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         env=env,

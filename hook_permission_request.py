@@ -71,6 +71,7 @@ def main():
 
     except Exception as e:
         # エラー時は許可（フック障害でブロックしない）
+        print(f"hook_permission_request error: {e}", file=sys.stderr)
         print(json.dumps(make_response("allow")))
 
     sys.exit(0)
