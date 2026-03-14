@@ -76,6 +76,7 @@ cp .env.example .env
 | `FORUM_CHANNEL_ID` | プロンプトを受け付けるフォーラムチャンネルのID |
 | `LOG_CHANNEL_ID` | 実行ログを送信するチャンネルのID |
 | `GUILD_ID` | BotがいるサーバーのID |
+| `SKIP_PERMISSIONS` | `true` で Claude Code の権限チェックをスキップ（デフォルト: `false`） |
 
 ### 3. Discord Botの準備
 
@@ -101,6 +102,16 @@ python bot.py
 ```
 
 > スレッドタイトルは新規セッション時のコンテキストとして自動的に付加されます。
+
+## Security
+
+> **Warning**
+> `SKIP_PERMISSIONS=true` を設定すると、Claude Code が `--dangerously-skip-permissions` モードで実行されます。
+> このモードではファイルの読み書き・コマンド実行が**確認なしで**行われます。
+>
+> - 必ず `ALLOWED_USERS` を信頼できるユーザーのみに限定してください
+> - Botを動かすマシン上で実行されるため、そのマシンへのアクセス権と同等のリスクがあります
+> - デフォルトは `false`（無効）です。通常モードではClaude Code側の権限確認が機能します
 
 ## License
 
