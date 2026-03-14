@@ -1,7 +1,28 @@
+# Environment / Secrets
 .env
+.env.*
+
+# Runtime data
 sessions.json
+.claude_hook_settings.json
+
+# Python
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+*.egg
+*.egg-info/
+dist/
+build/
+venv/
+.venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.coverage
+*.log
+
+# Project-specific exclusions
 *.bat
 twitter_media.py
-.claude_hook_settings.json

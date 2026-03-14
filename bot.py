@@ -22,7 +22,7 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 FORUM_CHANNEL_ID = int(os.getenv("FORUM_CHANNEL_ID", "0"))
 LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "0"))
 GUILD_ID = int(os.getenv("GUILD_ID", "0"))
-ALLOWED_USERS = set(os.getenv("ALLOWED_USERS", "").split(","))
+ALLOWED_USERS = set(filter(None, os.getenv("ALLOWED_USERS", "").split(",")))
 SKIP_PERMISSIONS = os.getenv("SKIP_PERMISSIONS", "false").lower() in ("true", "1", "yes")
 HOOK_PORT = int(os.getenv("HOOK_PORT", "8585"))
 
@@ -74,12 +74,6 @@ def format_tool_detail(tool_name: str, tool_input: dict) -> str:
 
 class PermissionView(discord.ui.View):
     """許可 / 常に許可 / 拒否 ボタン"""
-
-    def __init__(self, request_id: str, tool_name: str, thread_id: str):
-        super().__init__(timeout=600)
-        self.request_id = request_id
-        self.tool_name = tool_name
-        self.thread_id = thread_id
 
     def __init__(self, request_id: str, tool_name: str, thread_id: str, hook_type: str):
         super().__init__(timeout=600)
