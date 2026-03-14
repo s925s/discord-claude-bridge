@@ -87,7 +87,7 @@ cp .env.example .env
 1. [Discord Developer Portal](https://discord.com/developers/applications) でBotを作成
 2. **Privileged Gateway Intents** → **Message Content Intent** を有効化
 3. 必要な権限でBotをサーバーに招待：
-   - `Send Messages` / `Manage Threads` / `Read Message History`
+   - `Send Messages` / `Manage Threads` / `Read Message History` / `Embed Links`
 4. フォーラムチャンネルとログ用テキストチャンネルを作成
 
 ### 4. 起動

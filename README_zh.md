@@ -12,7 +12,7 @@
 [![License](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)](LICENSE)
 [![Platform](https://img.shields.io/badge/Windows-0078D4?style=for-the-badge&logo=windows&logoColor=white)](https://www.microsoft.com/windows)
 
-**将Discord论坛帖子变成Claude Code的对话会话。**
+**将Discord论坛主题帖变成Claude Code的对话会话。**
 
 ---
 
@@ -20,7 +20,7 @@
 
 ## 概述
 
-只需在Discord论坛频道中发帖，即可在服务器上执行 [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI的桥接Bot。每个帖子独立管理会话，保持对话上下文进行持续交互。
+只需在Discord论坛频道中发帖，即可在服务器上执行 [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI的桥接Bot。每个主题帖独立管理会话，保持对话上下文进行持续交互。
 
 ```mermaid
 graph LR
@@ -40,7 +40,7 @@ graph LR
 
 | 功能 | 说明 |
 |:---:|---|
-| **会话管理** | 每个帖子自动管理Claude Code会话，通过 `--resume` 继续对话 |
+| **会话管理** | 每个主题帖自动管理Claude Code会话，通过 `--resume` 继续对话 |
 | **Discord权限审批** | 在Claude Code执行工具前，通过Discord按钮进行允许/拒绝操作 |
 | **标签自动更新** | `运行中` / `已完成` / `错误` 标签实时切换 |
 | **执行日志** | 所有提示词、响应和状态以Embed形式记录到专用频道 |
@@ -87,7 +87,7 @@ cp .env.example .env
 1. 在 [Discord Developer Portal](https://discord.com/developers/applications) 创建Bot
 2. 在 **Privileged Gateway Intents** 中启用 **Message Content Intent**
 3. 使用所需权限邀请Bot：
-   - `Send Messages` / `Manage Threads` / `Read Message History`
+   - `Send Messages` / `Manage Threads` / `Read Message History` / `Embed Links`
 4. 创建论坛频道和日志文本频道
 
 ### 4. 启动
@@ -99,17 +99,17 @@ python bot.py
 ## 使用方法
 
 ```
-1. 在论坛频道创建帖子
-2. 在帖子中发送消息
+1. 在论坛频道创建主题帖
+2. 在主题帖中发送消息
 3. Bot执行Claude Code并回复
-4. 在同一帖子中继续对话
+4. 在同一主题帖中继续对话
 ```
 
-> 帖子标题会自动作为新会话的上下文附加。
+> 主题帖标题会自动作为新会话的上下文附加。
 
 ## 权限模式
 
-当 `SKIP_PERMISSIONS=false`（默认）时，Claude Code尝试使用文件编辑或命令执行等工具时，Discord帖子中会显示按钮。
+当 `SKIP_PERMISSIONS=false`（默认）时，Claude Code尝试使用文件编辑或命令执行等工具时，Discord主题帖中会显示按钮。
 
 ```mermaid
 sequenceDiagram
@@ -136,7 +136,7 @@ sequenceDiagram
 | 按钮 | 操作 |
 |:---:|---|
 | **允许** | 仅允许本次工具执行 |
-| **始终允许** | 在该帖子内自动允许同一工具 |
+| **始终允许** | 在该主题帖内自动允许同一工具 |
 | **拒绝** | 阻止工具执行 |
 
 > 只读工具（`Read`、`Glob`、`Grep` 等）自动允许。

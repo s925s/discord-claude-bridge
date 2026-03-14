@@ -87,7 +87,7 @@ Edit `.env` with the following:
 1. Create a bot at [Discord Developer Portal](https://discord.com/developers/applications)
 2. Enable **Message Content Intent** under **Privileged Gateway Intents**
 3. Invite the bot with required permissions:
-   - `Send Messages` / `Manage Threads` / `Read Message History`
+   - `Send Messages` / `Manage Threads` / `Read Message History` / `Embed Links`
 4. Create a forum channel and a text channel for logs
 
 ### 4. Start

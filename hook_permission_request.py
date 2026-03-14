@@ -14,6 +14,12 @@ import sys
 import json
 import urllib.request
 
+# 読み取り専用ツール — 自動許可（ボタン不要）
+SAFE_TOOLS = {
+    "Read", "Glob", "Grep", "WebSearch", "WebFetch",
+    "Agent", "TaskCreate", "TaskGet", "TaskList", "TaskUpdate", "TaskOutput",
+}
+
 
 def make_response(behavior: str, message: str = "", updated_input: dict = None) -> dict:
     """Claude Code 仕様の PermissionRequest レスポンスを生成"""
@@ -35,6 +41,11 @@ def main():
         input_data = json.load(sys.stdin)
         tool_name = input_data.get("tool_name", "")
         tool_input = input_data.get("tool_input", {})
+
+        # 安全なツールは即許可
+        if tool_name in SAFE_TOOLS:
+            print(json.dumps(make_response("allow")))
+            sys.exit(0)
 
         port = os.environ.get("HOOK_PORT", "8585")
         thread_id = os.environ.get("DISCORD_THREAD_ID", "")
