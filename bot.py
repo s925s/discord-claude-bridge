@@ -81,6 +81,46 @@ class PermissionView(discord.ui.View):
         self.tool_name = tool_name
         self.thread_id = thread_id
 
+    def __init__(self, request_id: str, tool_name: str, thread_id: str, hook_type: str):
+        super().__init__(timeout=600)
+        self.request_id = request_id
+        self.tool_name = tool_name
+        self.thread_id = thread_id
+        self.hook_type = hook_type
+
+    def _make_allow(self) -> dict:
+        """フックタイプに応じた許可レスポンスを生成"""
+        if self.hook_type == "PermissionRequest":
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PermissionRequest",
+                    "decision": {"behavior": "allow"},
+                }
+            }
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "allow",
+            }
+        }
+
+    def _make_deny(self, reason: str) -> dict:
+        """フックタイプに応じた拒否レスポンスを生成"""
+        if self.hook_type == "PermissionRequest":
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PermissionRequest",
+                    "decision": {"behavior": "deny", "message": reason},
+                }
+            }
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": reason,
+            }
+        }
+
     def _resolve(self, result: dict):
         permission_results[self.request_id] = result
         ev = permission_events.get(self.request_id)
@@ -89,7 +129,7 @@ class PermissionView(discord.ui.View):
 
     @discord.ui.button(label="許可", style=discord.ButtonStyle.green, emoji="✅")
     async def allow_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self._resolve({})
+        self._resolve(self._make_allow())
         self.stop()
         await interaction.response.edit_message(
             content=f"✅ `{self.tool_name}` を許可しました", view=None,
@@ -98,7 +138,7 @@ class PermissionView(discord.ui.View):
     @discord.ui.button(label="常に許可", style=discord.ButtonStyle.blurple, emoji="🔓")
     async def always_allow_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         allowed_tools.setdefault(self.thread_id, set()).add(self.tool_name)
-        self._resolve({})
+        self._resolve(self._make_allow())
         self.stop()
         await interaction.response.edit_message(
             content=f"🔓 `{self.tool_name}` を常に許可しました（このスレッド内）", view=None,
@@ -106,7 +146,7 @@ class PermissionView(discord.ui.View):
 
     @discord.ui.button(label="拒否", style=discord.ButtonStyle.red, emoji="❌")
     async def deny_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self._resolve({"decision": "block", "reason": "Discordユーザーが拒否しました"})
+        self._resolve(self._make_deny("Discordユーザーが拒否しました"))
         self.stop()
         await interaction.response.edit_message(
             content=f"❌ `{self.tool_name}` を拒否しました", view=None,
@@ -115,19 +155,37 @@ class PermissionView(discord.ui.View):
     async def on_timeout(self):
         # タイムアウト時は許可（ブロックしない）
         if self.request_id in permission_events:
-            self._resolve({})
+            self._resolve(self._make_allow())
+
+
+def make_quick_allow(hook_type: str) -> dict:
+    """即許可レスポンスを生成（常に許可済み/エラー時用）"""
+    if hook_type == "PermissionRequest":
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PermissionRequest",
+                "decision": {"behavior": "allow"},
+            }
+        }
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "allow",
+        }
+    }
 
 
 async def handle_permission_request(request: web.Request) -> web.Response:
-    """hook_pretooluse.py からの HTTP リクエストを処理"""
+    """フックスクリプトからの HTTP リクエストを処理"""
     data = await request.json()
+    hook_type = data.get("hook_type", "PreToolUse")
     tool_name = data.get("tool_name", "unknown")
     tool_input = data.get("tool_input", {})
     thread_id = data.get("thread_id", "")
 
     # 「常に許可」済みのツールは即応答
     if thread_id in allowed_tools and tool_name in allowed_tools[thread_id]:
-        return web.json_response({})
+        return web.json_response(make_quick_allow(hook_type))
 
     # Discord にボタン送信
     request_id = str(uuid.uuid4())
@@ -138,7 +196,7 @@ async def handle_permission_request(request: web.Request) -> web.Response:
         thread = bot.get_channel(int(thread_id)) if thread_id else None
         if thread:
             detail = format_tool_detail(tool_name, tool_input)
-            view = PermissionView(request_id, tool_name, thread_id)
+            view = PermissionView(request_id, tool_name, thread_id, hook_type)
             await thread.send(
                 f"🔐 **権限リクエスト: `{tool_name}`**\n{detail}",
                 view=view,
@@ -146,7 +204,7 @@ async def handle_permission_request(request: web.Request) -> web.Response:
     except Exception as e:
         print(f"権限リクエスト送信エラー: {e}")
         # 送信失敗時は許可
-        return web.json_response({})
+        return web.json_response(make_quick_allow(hook_type))
 
     # ユーザーの応答を待つ（最大10分）
     try:
@@ -172,19 +230,28 @@ async def start_hook_server():
 
 def build_hook_settings() -> str:
     """Claude Code に渡す hooks 設定 JSON ファイルを生成して返す"""
-    hook_script = str(Path(__file__).parent / "hook_pretooluse.py")
+    base_dir = Path(__file__).parent
+    pretooluse_script = str(base_dir / "hook_pretooluse.py")
+    permission_script = str(base_dir / "hook_permission_request.py")
     settings = {
         "hooks": {
             "PreToolUse": [{
                 "hooks": [{
                     "type": "command",
-                    "command": f'"{sys.executable}" "{hook_script}"',
+                    "command": f'"{sys.executable}" "{pretooluse_script}"',
+                    "timeout": 600,
+                }],
+            }],
+            "PermissionRequest": [{
+                "hooks": [{
+                    "type": "command",
+                    "command": f'"{sys.executable}" "{permission_script}"',
                     "timeout": 600,
                 }],
             }],
         },
     }
-    settings_path = Path(__file__).parent / ".claude_hook_settings.json"
+    settings_path = base_dir / ".claude_hook_settings.json"
     settings_path.write_text(json.dumps(settings, indent=2), encoding="utf-8")
     return str(settings_path)
 
