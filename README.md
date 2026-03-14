@@ -112,17 +112,24 @@ python bot.py
 ```mermaid
 sequenceDiagram
     participant CC as Claude Code
-    participant Hook as PreToolUse Hook
-    participant Bot as Bridge Bot
+    participant Hook as Hook Script
+    participant Bot as Bridge Bot (HTTP :8585)
     participant D as Discord
 
-    CC->>Hook: ツール実行リクエスト
+    CC->>Hook: ツール実行 or 権限ダイアログ
     Hook->>Bot: HTTP POST /permission
     Bot->>D: ボタン送信（許可/常に許可/拒否）
     D->>Bot: ユーザーがクリック
-    Bot->>Hook: 結果を返却
+    Bot->>Hook: 判定結果を返却
     Hook->>CC: 許可 or ブロック
 ```
+
+2つのフックで全ての確認をカバーします：
+
+| フック | 発火タイミング |
+|:---:|---|
+| **PreToolUse** | 全ツール実行前（読み取り専用ツールは自動許可） |
+| **PermissionRequest** | Claude Codeの権限確認ダイアログ表示時 |
 
 | ボタン | 動作 |
 |:---:|---|
@@ -131,6 +138,7 @@ sequenceDiagram
 | **拒否** | ツール実行をブロック |
 
 > 読み取り専用ツール（`Read`, `Glob`, `Grep` 等）は自動的に許可されます。
+> ポートは `HOOK_PORT` 環境変数で変更可能です（デフォルト: `8585`）。
 
 ## Security
 
