@@ -4,6 +4,9 @@ import json
 import asyncio
 import re
 import uuid
+import base64
+import io
+import tempfile
 from pathlib import Path
 from datetime import datetime
 
@@ -27,6 +30,9 @@ SKIP_PERMISSIONS = os.getenv("SKIP_PERMISSIONS", "false").lower() in ("true", "1
 HOOK_PORT = int(os.getenv("HOOK_PORT", "8585"))
 
 SESSIONS_FILE = Path(__file__).parent / "sessions.json"
+TEMP_DIR = Path(tempfile.gettempdir()) / "discord-claude-bridge"
+TEMP_DIR.mkdir(exist_ok=True)
+IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp'}
 SOFT_TIMEOUT = 600   # 10分で「まだやってるよ」メッセージ
 HARD_TIMEOUT = 3600  # 1時間で強制終了
 
@@ -280,14 +286,15 @@ def strip_ansi(text: str) -> str:
     return re.sub(r"\x1B\[[0-9;]*[a-zA-Z]", "", text)
 
 
-def parse_claude_output(raw: str, err: str, session_id: str | None) -> tuple[str, str | None]:
-    """Claude CLIの出力をパースして (応答テキスト, セッションID) を返す"""
+def parse_claude_output(raw: str, err: str, session_id: str | None) -> tuple[str, str | None, list]:
+    """Claude CLIの出力をパースして (応答テキスト, セッションID, 画像リスト) を返す"""
     print(f"[DEBUG] claude stdout ({len(raw)} chars): {raw[:500]}")
     if err:
         print(f"[DEBUG] claude stderr: {err[:300]}")
 
     new_session_id = session_id
     output = ""
+    images: list[tuple[bytes, str]] = []  # (data, filename)
     try:
         data = json.loads(raw)
         new_session_id = data.get("session_id", session_id)
@@ -295,7 +302,19 @@ def parse_claude_output(raw: str, err: str, session_id: str | None) -> tuple[str
         if isinstance(result, str):
             output = result
         elif isinstance(result, list):
-            texts = [b.get("text", "") for b in result if b.get("type") == "text"]
+            texts = []
+            for i, block in enumerate(result):
+                if block.get("type") == "text":
+                    texts.append(block.get("text", ""))
+                elif block.get("type") == "image":
+                    source = block.get("source", {})
+                    if source.get("type") == "base64":
+                        try:
+                            img_data = base64.b64decode(source["data"])
+                            ext = source.get("media_type", "image/png").split("/")[-1]
+                            images.append((img_data, f"image_{i}.{ext}"))
+                        except Exception as e:
+                            print(f"画像デコードエラー: {e}")
             output = "\n".join(texts)
         else:
             output = str(result)
@@ -306,10 +325,10 @@ def parse_claude_output(raw: str, err: str, session_id: str | None) -> tuple[str
 
     if not output and err:
         output = f"エラー: {err}"
-    if not output:
+    if not output and not images:
         output = "（Claude Codeからの応答が空でした。再度試してください）"
 
-    return output.strip(), new_session_id
+    return output.strip(), new_session_id, images
 
 
 async def run_claude(
@@ -317,7 +336,7 @@ async def run_claude(
     session_id: str | None = None,
     thread: discord.Thread | None = None,
     thread_title: str | None = None,
-) -> tuple[str, str | None]:
+) -> tuple[str, str | None, list]:
     """Claude Code CLI を実行して (応答テキスト, セッションID) を返す。"""
     args = ["claude", "-p", "--output-format", "json"]
 
@@ -374,20 +393,24 @@ async def run_claude(
             msg = f"タイムアウトしました（{HARD_TIMEOUT // 60}分超過、強制終了）"
             if placeholder:
                 await placeholder.edit(content=msg)
-            return msg, session_id
+            return msg, session_id, []
 
         raw = stdout.decode("utf-8", errors="replace").strip()
         err = stderr.decode("utf-8", errors="replace").strip()
-        output, new_session_id = parse_claude_output(raw, err, session_id)
+        output, new_session_id, images = parse_claude_output(raw, err, session_id)
 
         if placeholder:
             chunks = split_message(output, 2000)
             await placeholder.edit(content=chunks[0])
             for chunk in chunks[1:]:
                 await thread.send(chunk)
-            return None, new_session_id
+            if images:
+                for img_data, filename in images:
+                    file = discord.File(io.BytesIO(img_data), filename=filename)
+                    await thread.send(file=file)
+            return None, new_session_id, []
 
-        return output, new_session_id
+        return output, new_session_id, images
 
     raw = stdout.decode("utf-8", errors="replace").strip()
     err = stderr.decode("utf-8", errors="replace").strip()
@@ -462,13 +485,18 @@ async def send_log(guild: discord.Guild, user: str, thread_name: str, prompt: st
 # メッセージ分割送信
 # ==============================
 
-async def send_response(channel: discord.Thread, text: str):
-    if not text:
+async def send_response(channel: discord.Thread, text: str, images: list[tuple[bytes, str]] | None = None):
+    if not text and not images:
         await channel.send("（空の応答）")
         return
-    chunks = split_message(text, 2000)
-    for chunk in chunks:
-        await channel.send(chunk)
+    if text:
+        chunks = split_message(text, 2000)
+        for chunk in chunks:
+            await channel.send(chunk)
+    if images:
+        for img_data, filename in images:
+            file = discord.File(io.BytesIO(img_data), filename=filename)
+            await channel.send(file=file)
 
 
 def split_message(text: str, limit: int = 2000) -> list[str]:
@@ -529,14 +557,14 @@ async def process_queue():
 
                 async with thread.typing():
                     session_id = sessions.get(str(thread.id))
-                    result, new_session_id = await run_claude(prompt, session_id, thread, thread.name)
+                    result, new_session_id, images = await run_claude(prompt, session_id, thread, thread.name)
 
                     if new_session_id:
                         sessions[str(thread.id)] = new_session_id
                         save_sessions(sessions)
 
-                    if result is not None:
-                        await send_response(thread, result)
+                    if result is not None or images:
+                        await send_response(thread, result or "", images)
                     status = TAG_COMPLETED
 
             except Exception as e:
@@ -565,6 +593,23 @@ async def on_ready():
     print(f"権限モード: {'全スキップ' if SKIP_PERMISSIONS else f'Discord承認 (port {HOOK_PORT})'}")
 
 
+async def download_attachments(message: discord.Message) -> list[Path]:
+    """メッセージの画像添付をダウンロードしてパスのリストを返す"""
+    downloaded = []
+    for att in message.attachments:
+        ext = Path(att.filename).suffix.lower()
+        if ext not in IMAGE_EXTENSIONS:
+            continue
+        save_path = TEMP_DIR / f"{message.id}_{att.filename}"
+        try:
+            await att.save(save_path)
+            downloaded.append(save_path)
+            print(f"画像ダウンロード: {save_path}")
+        except Exception as e:
+            print(f"画像ダウンロードエラー ({att.filename}): {e}")
+    return downloaded
+
+
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot:
@@ -576,8 +621,15 @@ async def on_message(message: discord.Message):
     if str(message.author.id) not in ALLOWED_USERS:
         return
 
-    prompt = message.content
-    if not prompt or prompt.startswith("!"):
+    prompt = message.content or ""
+
+    # 画像添付をダウンロードしてプロンプトに追加
+    image_paths = await download_attachments(message)
+    if image_paths:
+        paths_str = "\n".join(f"  - {p}" for p in image_paths)
+        prompt += f"\n\n[添付画像（Readツールで閲覧可能）]\n{paths_str}"
+
+    if not prompt.strip() or prompt.startswith("!"):
         return
 
     sessions = load_sessions()
