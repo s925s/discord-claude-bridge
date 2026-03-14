@@ -78,19 +78,6 @@ Bot → スレッドに返信 + ログチャンネルに記録
 - セッションIDは `sessions.json` に保存され、`--resume` フラグで会話を継続します
 - 同時実行は `asyncio.Queue` で逐次処理されます
 
-## おまけ: Twitter Media Viewer
-
-`twitter_media.py` はDiscord Botとは独立したツールです。
-Twitterユーザーのメディア付きツイートをブラウザで一覧表示できます。
-
-```bash
-pip install flask requests beautifulsoup4 gallery-dl
-python twitter_media.py
-# → http://localhost:5000
-```
-
-- syndication API（ログイン不要）を優先し、取得できない場合は gallery-dl にフォールバック
-
 ## ライセンス
 
 MIT

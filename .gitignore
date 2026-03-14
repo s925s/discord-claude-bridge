@@ -3,3 +3,4 @@ sessions.json
 __pycache__/
 *.pyc
 *.bat
+twitter_media.py
