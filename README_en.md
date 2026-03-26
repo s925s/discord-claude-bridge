@@ -41,7 +41,10 @@ graph LR
 | Feature | Description |
 |:---:|---|
 | **Session Management** | Automatic Claude Code session management per thread. Continues conversations with `--resume` |
+| **Session Resume** | Resume PC Claude Code sessions in Discord via slash commands |
+| **Auto Working Directory** | Automatically detects and uses the session's working directory (cwd) |
 | **Discord Permission Approval** | Approve/deny tool executions via Discord buttons before Claude Code runs them |
+| **Image Support** | Send and receive image attachments. Analyze screenshots and more |
 | **Auto Tag Updates** | `Running` / `Completed` / `Error` tags update in real-time |
 | **Execution Logs** | All prompts, responses, and statuses recorded as Embeds in a separate channel |
 | **Timeout Control** | Progress notification at 10 min, force kill at 1 hour |
@@ -98,14 +101,31 @@ python bot.py
 
 ## Usage
 
+### Basic Usage
+
 ```
 1. Create a thread in the forum channel
-2. Post a message in the thread
+2. Post a message in the thread (image attachments supported)
 3. The bot executes Claude Code and replies
 4. Continue the conversation in the same thread
 ```
 
 > Thread titles are automatically included as context for new sessions.
+
+### Slash Commands
+
+| Command | Description |
+|---|---|
+| `/help` | Show available commands |
+| `/sessions [count]` | List PC's Claude Code sessions (default 10, max 20) |
+| `/resume <session_id> [title] [prompt]` | Resume a specific session in Discord |
+| `/resume-latest [title] [prompt]` | Resume the latest session with one click |
+
+### Prefix Commands
+
+| Command | Description |
+|---|---|
+| `!sync` | Sync slash commands to Discord (run once after adding/changing commands) |
 
 ## Permission Mode
 

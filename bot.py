@@ -3,6 +3,10 @@ import sys
 import json
 import asyncio
 import re
+
+# Windows: aiodns が SelectorEventLoop を要求する問題を回避
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 import uuid
 import base64
 import io
@@ -336,6 +340,7 @@ async def run_claude(
     session_id: str | None = None,
     thread: discord.Thread | None = None,
     thread_title: str | None = None,
+    cwd: str | None = None,
 ) -> tuple[str, str | None, list]:
     """Claude Code CLI を実行して (応答テキスト, セッションID) を返す。"""
     args = ["claude", "-p", "--output-format", "json"]
@@ -369,6 +374,7 @@ async def run_claude(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         env=env,
+        cwd=cwd,
     )
 
     # ソフトタイムアウトで待つ
@@ -545,7 +551,8 @@ async def process_queue():
     processing = True
     try:
         while not queue.empty():
-            thread, message, prompt, sessions = await queue.get()
+            thread, message, prompt, sessions, *extra = await queue.get()
+            cwd = extra[0] if extra else None
             status = TAG_RUNNING
             result = ""
             try:
@@ -557,11 +564,19 @@ async def process_queue():
 
                 async with thread.typing():
                     session_id = sessions.get(str(thread.id))
-                    result, new_session_id, images = await run_claude(prompt, session_id, thread, thread.name)
+                    # cwd未指定でresumeの場合、セッションのプロジェクトパスを自動解決
+                    run_cwd = cwd
+                    if not run_cwd and session_id:
+                        run_cwd = find_session_cwd(session_id)
+                    if not run_cwd:
+                        run_cwd = str(Path.home())
+                    result, new_session_id, images = await run_claude(prompt, session_id, thread, thread.name, cwd=run_cwd)
 
                     if new_session_id:
                         sessions[str(thread.id)] = new_session_id
                         save_sessions(sessions)
+                        if not session_id:
+                            await thread.send(f"🆔 Session: `{new_session_id}`")
 
                     if result is not None or images:
                         await send_response(thread, result or "", images)
@@ -580,6 +595,15 @@ async def process_queue():
                 queue.task_done()
     finally:
         processing = False
+
+
+@bot.command(name="sync")
+async def sync_commands(ctx: commands.Context):
+    """スラッシュコマンドを手動同期（!sync）"""
+    if str(ctx.author.id) not in ALLOWED_USERS:
+        return
+    synced = await bot.tree.sync()
+    await ctx.send(f"✅ {len(synced)}個のコマンドを同期しました")
 
 
 @bot.event
@@ -610,10 +634,326 @@ async def download_attachments(message: discord.Message) -> list[Path]:
     return downloaded
 
 
+def decode_project_path(encoded: str) -> str | None:
+    """プロジェクトディレクトリ名からファイルシステムパスを復元する。
+    例: 'C--Users-user-discord-claude-bridge' → 'C:\\Users\\user\\discord-claude-bridge'
+    """
+    if not encoded or "--" not in encoded:
+        return None
+    parts = encoded.split("--", 1)
+    if len(parts) != 2:
+        return None
+    drive = parts[0] + ":"
+    rest = parts[1]
+    segments = rest.split("-")
+
+    def resolve(idx: int, current: str) -> str | None:
+        if idx >= len(segments):
+            return current if os.path.isdir(current) else None
+        # 長い方から試す（ハイフン入りディレクトリ名に対応）
+        for end in range(len(segments), idx, -1):
+            segment = "-".join(segments[idx:end])
+            candidate = os.path.join(current, segment)
+            if os.path.isdir(candidate):
+                result = resolve(end, candidate)
+                if result:
+                    return result
+        return None
+
+    return resolve(0, drive + os.sep)
+
+
+def find_session_cwd(session_id: str) -> str | None:
+    """セッションIDからそのセッションが属するプロジェクトのパスを返す"""
+    proj_dir = Path.home() / ".claude" / "projects"
+    if not proj_dir.exists():
+        return None
+    for d in proj_dir.iterdir():
+        if not d.is_dir():
+            continue
+        session_file = d / f"{session_id}.jsonl"
+        if session_file.exists():
+            resolved = decode_project_path(d.name)
+            if resolved:
+                return resolved
+    return None
+
+
+def get_recent_sessions(limit: int = 10, exclude_discord: bool = False) -> list[dict]:
+    """PCのClaude Codeセッションファイルを読み取り、最新順で返す"""
+    # Discordで既に使用中のセッションIDを除外リストに
+    used_sids = set()
+    if exclude_discord:
+        try:
+            used_sids = set(load_sessions().values())
+        except Exception:
+            pass
+
+    proj_dir = Path.home() / ".claude" / "projects"
+    results = []
+    for d in proj_dir.iterdir():
+        if not d.is_dir():
+            continue
+        for fp in d.glob("*.jsonl"):
+            if "subagents" in str(fp):
+                continue
+            sid = fp.stem
+            if exclude_discord and sid in used_sids:
+                continue
+            mtime = fp.stat().st_mtime
+            dt = datetime.fromtimestamp(mtime).strftime("%m/%d %H:%M")
+            project = d.name.replace("C--Users-user-", "").replace("C--Users-user", "(home)")
+
+            first_msg = ""
+            try:
+                with open(fp, "r", encoding="utf-8") as f:
+                    for line in f:
+                        rec = json.loads(line)
+                        if rec.get("type") == "user":
+                            msg = rec.get("message", "")
+                            if isinstance(msg, dict):
+                                content = msg.get("content", "")
+                                if isinstance(content, str):
+                                    first_msg = content
+                                elif isinstance(content, list):
+                                    for b in content:
+                                        if isinstance(b, dict) and b.get("type") == "text":
+                                            first_msg = b["text"]
+                                            break
+                            elif isinstance(msg, str):
+                                first_msg = msg
+                            if first_msg:
+                                break
+            except Exception:
+                pass
+
+            first_msg = first_msg.replace("\n", " ").strip()[:50]
+            results.append({
+                "session_id": sid,
+                "mtime": mtime,
+                "date": dt,
+                "project": project,
+                "first_msg": first_msg,
+            })
+
+    results.sort(key=lambda x: x["mtime"], reverse=True)
+    return results[:limit]
+
+
+@bot.tree.command(name="sessions", description="PCのClaude Codeセッション一覧を表示する（最新10件）")
+@discord.app_commands.describe(
+    件数="表示するセッション数（デフォルト10、最大20）",
+)
+async def list_sessions(interaction: discord.Interaction, 件数: int = 10):
+    if str(interaction.user.id) not in ALLOWED_USERS:
+        await interaction.response.send_message("権限がありません", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    count = max(1, min(件数, 20))
+    sessions = get_recent_sessions(count)
+    if not sessions:
+        await interaction.followup.send("セッションが見つかりませんでした", ephemeral=True)
+        return
+
+    lines = []
+    for i, s in enumerate(sessions, 1):
+        lines.append(
+            f"**{i}.** `{s['date']}` [{s['project']}]\n"
+            f"   `{s['session_id']}`\n"
+            f"   {s['first_msg'] or '（メッセージなし）'}"
+        )
+    text = "**PCのClaude Codeセッション一覧**\n\n" + "\n\n".join(lines)
+    # 2000文字超えたら分割
+    chunks = split_message(text, 2000)
+    await interaction.followup.send(chunks[0], ephemeral=True)
+    for chunk in chunks[1:]:
+        await interaction.followup.send(chunk, ephemeral=True)
+
+
+@bot.tree.command(name="resume-latest", description="PCの最新セッションを引き継いでフォーラムスレッドを作成する")
+@discord.app_commands.describe(
+    title="スレッドのタイトル（省略時は自動生成）",
+    prompt="最初に送るメッセージ（省略時はセッション要約をリクエスト）",
+)
+async def resume_latest(
+    interaction: discord.Interaction,
+    title: str = "",
+    prompt: str = "",
+):
+    if str(interaction.user.id) not in ALLOWED_USERS:
+        await interaction.response.send_message("権限がありません", ephemeral=True)
+        return
+
+    await interaction.response.defer(thinking=True)
+
+    # フォーラムチャンネル取得
+    forum = interaction.guild.get_channel(FORUM_CHANNEL_ID)
+    if not forum:
+        try:
+            forum = await interaction.guild.fetch_channel(FORUM_CHANNEL_ID)
+        except Exception:
+            await interaction.followup.send("フォーラムチャンネルが見つかりません", ephemeral=True)
+            return
+
+    if not isinstance(forum, discord.ForumChannel):
+        await interaction.followup.send("指定されたチャンネルはフォーラムではありません", ephemeral=True)
+        return
+
+    # セッション取得（Discord既使用分は除外）
+    recent = get_recent_sessions(1, exclude_discord=True)
+    if not recent:
+        await interaction.followup.send("セッションが見つかりませんでした", ephemeral=True)
+        return
+
+    latest = recent[0]
+    session_id = latest["session_id"]
+
+    if not title:
+        msg_preview = latest["first_msg"][:30] if latest["first_msg"] else session_id[:8]
+        title = f"PC引継ぎ: {msg_preview}"
+
+    try:
+        initial_prompt = prompt or "これはPCのClaude Codeセッションからの引き継ぎです。これまでの会話の内容を簡潔に要約してください。"
+        thread_with_message = await forum.create_thread(
+            name=title,
+            content=f"🔗 **PCセッション引き継ぎ（最新）**\nセッションID: `{session_id}`\n元の会話: {latest['first_msg'] or '（不明）'}\n\n{initial_prompt}",
+        )
+        thread = thread_with_message.thread
+        message = thread_with_message.message
+    except Exception as e:
+        await interaction.followup.send(f"スレッド作成エラー: {e}", ephemeral=True)
+        return
+
+    sessions_data = load_sessions()
+    sessions_data[str(thread.id)] = session_id
+    save_sessions(sessions_data)
+
+    await interaction.followup.send(
+        f"✅ 最新セッションを引き継ぎ: {thread.mention}\n"
+        f"セッション: `{session_id}`\n"
+        f"元の会話: {latest['first_msg'] or '（不明）'}"
+    )
+
+    await queue.put((thread, message, initial_prompt, sessions_data))
+    await process_queue()
+
+
+@bot.tree.command(name="help", description="使えるコマンド一覧を表示する")
+async def show_help(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="Discord Claude Bridge - コマンド一覧",
+        color=discord.Color.blue(),
+    )
+    embed.add_field(
+        name="/help",
+        value="このヘルプを表示する",
+        inline=False,
+    )
+    embed.add_field(
+        name="/sessions [件数]",
+        value="PCのClaude Codeセッション一覧を表示する（デフォルト10件、最大20件）",
+        inline=False,
+    )
+    embed.add_field(
+        name="/resume <session_id> [title] [prompt]",
+        value="セッションIDを指定してフォーラムスレッドを作成し、PCのセッションを引き継ぐ",
+        inline=False,
+    )
+    embed.add_field(
+        name="/resume-latest [title] [prompt]",
+        value="PCの最新セッションをワンクリックで引き継ぐ",
+        inline=False,
+    )
+    embed.add_field(
+        name="フォーラムに投稿",
+        value="フォーラムにスレッドを立てるか、既存スレッドにメッセージを送ると、Claude Codeが応答します",
+        inline=False,
+    )
+    embed.add_field(
+        name="!sync",
+        value="スラッシュコマンドをDiscordに同期する（コマンド追加・変更時に1回実行）",
+        inline=False,
+    )
+    embed.set_footer(text="画像添付にも対応しています")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="resume", description="セッションIDを指定してPCのClaude Codeセッションを引き継ぐ")
+@discord.app_commands.describe(
+    session_id="Claude CodeのセッションID（claude --resume で使うやつ）",
+    title="スレッドのタイトル（省略時は自動生成）",
+    prompt="最初に送るメッセージ（省略時はセッション要約をリクエスト）",
+)
+async def resume_session(
+    interaction: discord.Interaction,
+    session_id: str,
+    title: str = "",
+    prompt: str = "",
+):
+    # 権限チェック
+    if str(interaction.user.id) not in ALLOWED_USERS:
+        await interaction.response.send_message("権限がありません", ephemeral=True)
+        return
+
+    await interaction.response.defer(thinking=True)
+
+    # フォーラムチャンネル取得
+    forum = interaction.guild.get_channel(FORUM_CHANNEL_ID)
+    if not forum:
+        try:
+            forum = await interaction.guild.fetch_channel(FORUM_CHANNEL_ID)
+        except Exception:
+            await interaction.followup.send("フォーラムチャンネルが見つかりません", ephemeral=True)
+            return
+
+    if not isinstance(forum, discord.ForumChannel):
+        await interaction.followup.send("指定されたチャンネルはフォーラムではありません", ephemeral=True)
+        return
+
+    # タイトル生成（セッションの最初のメッセージをプレビュー）
+    if not title:
+        sessions_list = get_recent_sessions(100)
+        matched = [s for s in sessions_list if s["session_id"] == session_id]
+        if matched and matched[0]["first_msg"]:
+            title = f"PC引継ぎ: {matched[0]['first_msg'][:30]}"
+        else:
+            title = f"PC引継ぎ: {session_id[:8]}..."
+
+    # フォーラムスレッド作成
+    try:
+        initial_prompt = prompt or "これはPCのClaude Codeセッションからの引き継ぎです。これまでの会話の内容を簡潔に要約してください。"
+        thread_with_message = await forum.create_thread(
+            name=title,
+            content=f"🔗 **PCセッション引き継ぎ**\nセッションID: `{session_id}`\n\n{initial_prompt}",
+        )
+        thread = thread_with_message.thread
+        message = thread_with_message.message
+    except Exception as e:
+        await interaction.followup.send(f"スレッド作成エラー: {e}", ephemeral=True)
+        return
+
+    # セッションID紐付け
+    sessions = load_sessions()
+    sessions[str(thread.id)] = session_id
+    save_sessions(sessions)
+
+    await interaction.followup.send(f"✅ スレッド作成完了: {thread.mention}\nセッション `{session_id}` を引き継ぎます")
+
+    # Claude Code実行（セッション引き継ぎ）
+    await queue.put((thread, message, initial_prompt, sessions))
+    await process_queue()
+
+
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot:
         return
+
+    # !コマンド（!sync等）を処理
+    await bot.process_commands(message)
+
     if not isinstance(message.channel, discord.Thread):
         return
     if message.channel.parent_id != FORUM_CHANNEL_ID:

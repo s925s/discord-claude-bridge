@@ -5,6 +5,7 @@
 # Runtime data
 sessions.json
 .claude_hook_settings.json
+bot.pid
 
 # Python
 __pycache__/
