@@ -3,6 +3,7 @@ import sys
 import json
 import asyncio
 import re
+import subprocess
 
 # Windows: aiodns が SelectorEventLoop を要求する問題を回避
 if sys.platform == "win32":
@@ -368,59 +369,61 @@ async def run_claude(
     if thread:
         env["DISCORD_THREAD_ID"] = str(thread.id)
 
-    proc = await asyncio.create_subprocess_exec(
-        *args,
-        stdin=asyncio.subprocess.DEVNULL,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        env=env,
-        cwd=cwd,
-    )
-
-    # ソフトタイムアウトで待つ
-    try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=SOFT_TIMEOUT)
-    except asyncio.TimeoutError:
-        elapsed = SOFT_TIMEOUT // 60
-        placeholder = None
-        if thread:
-            placeholder = await thread.send(f"まだ処理中です（{elapsed}分経過）… 終わったら更新します")
-
+    def _run_subprocess():
+        proc = subprocess.Popen(
+            args,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            cwd=cwd,
+        )
         try:
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(), timeout=HARD_TIMEOUT - SOFT_TIMEOUT,
-            )
-        except asyncio.TimeoutError:
+            stdout, stderr = proc.communicate(timeout=HARD_TIMEOUT)
+        except subprocess.TimeoutExpired:
             proc.kill()
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=5)
-            except asyncio.TimeoutError:
-                pass
-            msg = f"タイムアウトしました（{HARD_TIMEOUT // 60}分超過、強制終了）"
-            if placeholder:
-                await placeholder.edit(content=msg)
-            return msg, session_id, []
+            stdout, stderr = proc.communicate()
+            return None, None, True  # timed out
+        return stdout, stderr, False
 
-        raw = stdout.decode("utf-8", errors="replace").strip()
-        err = stderr.decode("utf-8", errors="replace").strip()
-        output, new_session_id, images = parse_claude_output(raw, err, session_id)
+    # ソフトタイムアウト通知用タスク
+    placeholder = None
+    if thread:
+        async def _soft_timeout_notify():
+            nonlocal placeholder
+            await asyncio.sleep(SOFT_TIMEOUT)
+            placeholder = await thread.send(f"まだ処理中です（{SOFT_TIMEOUT // 60}分経過）… 終わったら更新します")
+        notify_task = asyncio.create_task(_soft_timeout_notify())
+    else:
+        notify_task = None
 
+    stdout, stderr, timed_out = await asyncio.to_thread(_run_subprocess)
+
+    if notify_task and not notify_task.done():
+        notify_task.cancel()
+
+    if timed_out:
+        msg = f"タイムアウトしました（{HARD_TIMEOUT // 60}分超過、強制終了）"
         if placeholder:
-            chunks = split_message(output, 2000)
-            await placeholder.edit(content=chunks[0])
-            for chunk in chunks[1:]:
-                await thread.send(chunk)
-            if images:
-                for img_data, filename in images:
-                    file = discord.File(io.BytesIO(img_data), filename=filename)
-                    await thread.send(file=file)
-            return None, new_session_id, []
-
-        return output, new_session_id, images
+            await placeholder.edit(content=msg)
+        return msg, session_id, []
 
     raw = stdout.decode("utf-8", errors="replace").strip()
     err = stderr.decode("utf-8", errors="replace").strip()
-    return parse_claude_output(raw, err, session_id)
+    output, new_session_id, images = parse_claude_output(raw, err, session_id)
+
+    if placeholder:
+        chunks = split_message(output, 2000)
+        await placeholder.edit(content=chunks[0])
+        for chunk in chunks[1:]:
+            await thread.send(chunk)
+        if images:
+            for img_data, filename in images:
+                file = discord.File(io.BytesIO(img_data), filename=filename)
+                await thread.send(file=file)
+        return None, new_session_id, []
+
+    return output, new_session_id, images
 
 
 # ==============================
@@ -583,6 +586,8 @@ async def process_queue():
                     status = TAG_COMPLETED
 
             except Exception as e:
+                import traceback
+                traceback.print_exc()
                 result = str(e)
                 status = TAG_ERROR
                 await thread.send(f"エラーが発生しました: {e}")
@@ -610,7 +615,8 @@ async def sync_commands(ctx: commands.Context):
 async def on_ready():
     if not SKIP_PERMISSIONS:
         await start_hook_server()
-    print(f"Bot起動: {bot.user}")
+    synced = await bot.tree.sync()
+    print(f"Bot起動: {bot.user} ({len(synced)}個のコマンドを同期)")
     print(f"フォーラムチャンネルID: {FORUM_CHANNEL_ID}")
     print(f"ログチャンネルID: {LOG_CHANNEL_ID}")
     print(f"許可ユーザー: {ALLOWED_USERS}")
