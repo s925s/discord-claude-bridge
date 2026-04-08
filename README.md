@@ -61,7 +61,7 @@ graph LR
 ### 1. インストール
 
 ```bash
-git clone https://github.com/s925s/discord-claude-bridge.git
+git clone https://github.com/cUDGk/discord-claude-bridge.git
 cd discord-claude-bridge
 pip install -r requirements.txt
 ```
