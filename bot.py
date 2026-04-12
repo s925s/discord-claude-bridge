@@ -774,63 +774,124 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-queue = asyncio.Queue()
-processing = False
+# ==============================
+# スレッド単位の並列キュー
+# ==============================
+# 別スレッドからの要求は並列実行、同一スレッド内は順次実行。
+# 並列数は MAX_CONCURRENT_RUNS で頭打ち（API/CPU/RAM を食い過ぎないため）。
+MAX_CONCURRENT_RUNS = int(os.getenv("MAX_CONCURRENT_RUNS", "5"))
+
+thread_queues: dict[int, asyncio.Queue] = {}
+thread_workers: dict[int, asyncio.Task] = {}
+concurrency_sem = asyncio.Semaphore(MAX_CONCURRENT_RUNS)
+sessions_lock = asyncio.Lock()
+_worker_lock = asyncio.Lock()
 
 
-async def process_queue():
-    global processing
-    if processing:
-        return
-    processing = True
-    try:
-        while not queue.empty():
-            thread, message, prompt, sessions, *extra = await queue.get()
-            cwd = extra[0] if extra else None
-            status = TAG_RUNNING
-            result = ""
+async def get_session_id(thread_key: str) -> str | None:
+    async with sessions_lock:
+        return load_sessions().get(thread_key)
+
+
+async def set_session_id(thread_key: str, session_id: str):
+    async with sessions_lock:
+        sessions = load_sessions()
+        sessions[thread_key] = session_id
+        save_sessions(sessions)
+
+
+async def enqueue_for_thread(
+    thread: discord.Thread,
+    message: discord.Message,
+    prompt: str,
+    cwd: str | None = None,
+):
+    """スレッド単位のキューに要求を積み、必要ならワーカータスクを起動"""
+    tid = thread.id
+    async with _worker_lock:
+        q = thread_queues.setdefault(tid, asyncio.Queue())
+        q.put_nowait((thread, message, prompt, cwd))
+        worker = thread_workers.get(tid)
+        if worker is None or worker.done():
+            thread_workers[tid] = asyncio.create_task(process_thread(tid))
+
+
+async def process_thread(tid: int):
+    """単一スレッドのキューを順番に処理するワーカー"""
+    q = thread_queues[tid]
+    while True:
+        # drain phase
+        while True:
             try:
-                await set_thread_tag(thread, TAG_RUNNING)
-                await send_log(
-                    thread.guild, str(message.author),
-                    thread.name, prompt, "", TAG_RUNNING,
-                )
+                thread, message, prompt, cwd = q.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            async with concurrency_sem:
+                try:
+                    await _run_one(thread, message, prompt, cwd)
+                finally:
+                    q.task_done()
+        # atomic check-and-exit: ロック内で再確認し、本当に空なら辞書から除去して終了
+        async with _worker_lock:
+            if q.empty():
+                thread_queues.pop(tid, None)
+                thread_workers.pop(tid, None)
+                return
 
-                async with thread.typing():
-                    session_id = sessions.get(str(thread.id))
-                    # cwd未指定でresumeの場合、セッションのプロジェクトパスを自動解決
-                    run_cwd = cwd
-                    if not run_cwd and session_id:
-                        run_cwd = find_session_cwd(session_id)
-                    if not run_cwd:
-                        run_cwd = str(Path.home())
-                    result, new_session_id, images = await run_claude(prompt, session_id, thread, thread.name, cwd=run_cwd)
 
-                    if new_session_id:
-                        sessions[str(thread.id)] = new_session_id
-                        save_sessions(sessions)
-                        if not session_id:
-                            await thread.send(f"🆔 Session: `{new_session_id}`")
+async def _run_one(
+    thread: discord.Thread,
+    message: discord.Message,
+    prompt: str,
+    cwd: str | None,
+):
+    """1メッセージ分の Claude 実行"""
+    status = TAG_RUNNING
+    result = ""
+    try:
+        await set_thread_tag(thread, TAG_RUNNING)
+        await send_log(
+            thread.guild, str(message.author),
+            thread.name, prompt, "", TAG_RUNNING,
+        )
 
-                    if result is not None or images:
-                        await send_response(thread, result or "", images)
-                    status = TAG_COMPLETED
+        async with thread.typing():
+            thread_key = str(thread.id)
+            session_id = await get_session_id(thread_key)
+            # cwd 未指定で resume の場合、セッションのプロジェクトパスを自動解決
+            run_cwd = cwd
+            if not run_cwd and session_id:
+                run_cwd = find_session_cwd(session_id)
+            if not run_cwd:
+                run_cwd = str(Path.home())
+            result, new_session_id, images = await run_claude(
+                prompt, session_id, thread, thread.name, cwd=run_cwd,
+            )
 
-            except Exception as e:
-                import traceback
-                traceback.print_exc()
-                result = str(e)
-                status = TAG_ERROR
-                await thread.send(f"エラーが発生しました: {e}")
-            finally:
-                await set_thread_tag(thread, status)
-                await send_log(
-                    thread.guild, str(message.author),
-                    thread.name, prompt, result, status,
-                )
-                queue.task_done()
+            if new_session_id:
+                await set_session_id(thread_key, new_session_id)
+                if not session_id:
+                    await thread.send(f"🆔 Session: `{new_session_id}`")
+
+            if result is not None or images:
+                await send_response(thread, result or "", images)
+            status = TAG_COMPLETED
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        result = str(e)
+        status = TAG_ERROR
+        try:
+            await thread.send(f"エラーが発生しました: {e}")
+        except Exception:
+            pass
     finally:
-        processing = False
+        await set_thread_tag(thread, status)
+        await send_log(
+            thread.guild, str(message.author),
+            thread.name, prompt, result, status,
+        )
 
 
 @bot.command(name="sync")
@@ -1063,9 +1124,7 @@ async def resume_latest(
         await interaction.followup.send(f"スレッド作成エラー: {e}", ephemeral=True)
         return
 
-    sessions_data = load_sessions()
-    sessions_data[str(thread.id)] = session_id
-    save_sessions(sessions_data)
+    await set_session_id(str(thread.id), session_id)
 
     await interaction.followup.send(
         f"✅ 最新セッションを引き継ぎ: {thread.mention}\n"
@@ -1073,8 +1132,7 @@ async def resume_latest(
         f"元の会話: {latest['first_msg'] or '（不明）'}"
     )
 
-    await queue.put((thread, message, initial_prompt, sessions_data))
-    await process_queue()
+    await enqueue_for_thread(thread, message, initial_prompt)
 
 
 @bot.tree.command(name="help", description="使えるコマンド一覧を表示する")
@@ -1172,15 +1230,12 @@ async def resume_session(
         return
 
     # セッションID紐付け
-    sessions = load_sessions()
-    sessions[str(thread.id)] = session_id
-    save_sessions(sessions)
+    await set_session_id(str(thread.id), session_id)
 
     await interaction.followup.send(f"✅ スレッド作成完了: {thread.mention}\nセッション `{session_id}` を引き継ぎます")
 
     # Claude Code実行（セッション引き継ぎ）
-    await queue.put((thread, message, initial_prompt, sessions))
-    await process_queue()
+    await enqueue_for_thread(thread, message, initial_prompt)
 
 
 @bot.event
@@ -1209,9 +1264,7 @@ async def on_message(message: discord.Message):
     if not prompt.strip() or prompt.startswith("!"):
         return
 
-    sessions = load_sessions()
-    await queue.put((message.channel, message, prompt, sessions))
-    await process_queue()
+    await enqueue_for_thread(message.channel, message, prompt)
 
 
 bot.run(TOKEN)
