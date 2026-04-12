@@ -35,3 +35,5 @@ Thumbs.db
 # Project-specific exclusions
 *.bat
 twitter_media.py
+bot.py.bak
+_restart_self.py

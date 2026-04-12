@@ -4,6 +4,7 @@ import json
 import asyncio
 import re
 import subprocess
+import threading
 
 # Windows: aiodns が SelectorEventLoop を要求する問題を回避
 if sys.platform == "win32":
@@ -163,6 +164,113 @@ class PermissionView(discord.ui.View):
             self._resolve(self._make_allow())
 
 
+class QuestionView(discord.ui.View):
+    """AskUserQuestion 用: 選択肢ボタンを並べる"""
+
+    def __init__(self, request_id: str, thread_id: str, hook_type: str, options: list):
+        super().__init__(timeout=600)
+        self.request_id = request_id
+        self.thread_id = thread_id
+        self.hook_type = hook_type
+        for i, label in enumerate(options[:20]):
+            btn = discord.ui.Button(
+                label=(label or f"選択肢{i+1}")[:80],
+                style=discord.ButtonStyle.primary,
+                custom_id=f"q_{request_id}_{i}",
+            )
+            btn.callback = self._make_callback(label)
+            self.add_item(btn)
+
+    def _build_response(self, answer: str) -> dict:
+        reason = f"User answered: {answer}. Treat this as the user's answer and continue."
+        if self.hook_type == "PermissionRequest":
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PermissionRequest",
+                    "decision": {"behavior": "deny", "message": reason},
+                }
+            }
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": reason,
+            }
+        }
+
+    def _make_callback(self, answer: str):
+        async def cb(interaction: discord.Interaction):
+            result = self._build_response(answer)
+            permission_results[self.request_id] = result
+            ev = permission_events.get(self.request_id)
+            if ev:
+                ev.set()
+            self.stop()
+            await interaction.response.edit_message(
+                content=f"✅ 回答: {answer[:200]}", view=None,
+            )
+        return cb
+
+    async def on_timeout(self):
+        if self.request_id in permission_events:
+            permission_results[self.request_id] = self._build_response("（タイムアウト）")
+            permission_events[self.request_id].set()
+
+
+async def _handle_ask_user_question(tool_input: dict, thread_id: str, hook_type: str) -> "web.Response":
+    """AskUserQuestion ツールを Discord の選択肢ボタンで処理"""
+    questions = tool_input.get("questions") or tool_input.get("question")
+    q_list = []
+    if isinstance(questions, list):
+        q_list = questions
+    elif isinstance(questions, dict):
+        q_list = [questions]
+    elif isinstance(questions, str):
+        q_list = [{"question": questions, "options": []}]
+
+    q = q_list[0] if q_list else {}
+    q_text = q.get("question") or q.get("header") or tool_input.get("question") or "Claude からの質問"
+    options: list = []
+    for opt in (q.get("options") or []):
+        if isinstance(opt, dict):
+            label = opt.get("label") or opt.get("name") or opt.get("value") or ""
+            desc = opt.get("description") or ""
+            options.append(f"{label}: {desc}" if desc and label else (label or desc))
+        elif isinstance(opt, str):
+            options.append(opt)
+    if not options:
+        options = ["はい", "いいえ"]
+
+    request_id = str(uuid.uuid4())
+    event = asyncio.Event()
+    permission_events[request_id] = event
+
+    try:
+        thread = bot.get_channel(int(thread_id)) if thread_id else None
+        if thread:
+            view = QuestionView(request_id, thread_id, hook_type, options)
+            await thread.send(f"❓ **Claudeからの質問**\n{str(q_text)[:1500]}", view=view)
+        else:
+            permission_events.pop(request_id, None)
+            return web.json_response(make_quick_allow(hook_type))
+    except Exception as e:
+        print(f"質問送信エラー: {e}")
+        permission_events.pop(request_id, None)
+        permission_results.pop(request_id, None)
+        return web.json_response(make_quick_allow(hook_type))
+
+    try:
+        await asyncio.wait_for(event.wait(), timeout=600)
+    except asyncio.TimeoutError:
+        pass
+
+    result = permission_results.pop(request_id, None)
+    permission_events.pop(request_id, None)
+    if result is None:
+        result = make_quick_allow(hook_type)
+    return web.json_response(result)
+
+
 def make_quick_allow(hook_type: str) -> dict:
     """即許可レスポンスを生成（常に許可済み/エラー時用）"""
     if hook_type == "PermissionRequest":
@@ -180,6 +288,39 @@ def make_quick_allow(hook_type: str) -> dict:
     }
 
 
+async def handle_notification(request: web.Request) -> web.Response:
+    """Notification フックからの通知を Discord スレッドに転送"""
+    try:
+        data = await request.json()
+    except Exception:
+        return web.json_response({})
+
+    message = data.get("message", "") or ""
+    title = data.get("title", "") or ""
+    ntype = data.get("notification_type", "") or ""
+    thread_id = data.get("thread_id", "")
+
+    try:
+        thread = bot.get_channel(int(thread_id)) if thread_id else None
+        if thread:
+            icon = {
+                "permission_prompt": "🔐",
+                "idle_prompt": "💤",
+                "elicitation_dialog": "📝",
+                "auth_success": "🔑",
+            }.get(ntype, "🔔")
+            parts = [f"{icon} **{title or '通知'}**"]
+            if ntype:
+                parts[0] += f"  `{ntype}`"
+            if message:
+                parts.append(str(message)[:1800])
+            await thread.send("\n".join(parts))
+    except Exception as e:
+        print(f"通知転送エラー: {e}")
+
+    return web.json_response({})
+
+
 async def handle_permission_request(request: web.Request) -> web.Response:
     """フックスクリプトからの HTTP リクエストを処理"""
     data = await request.json()
@@ -187,9 +328,14 @@ async def handle_permission_request(request: web.Request) -> web.Response:
     tool_name = data.get("tool_name", "unknown")
     tool_input = data.get("tool_input", {})
     thread_id = data.get("thread_id", "")
+    sensitive = bool(data.get("sensitive", False))
 
-    # 「常に許可」済みのツールは即応答
-    if thread_id in allowed_tools and tool_name in allowed_tools[thread_id]:
+    # AskUserQuestion は選択肢ボタンとして扱う（常に許可の対象外）
+    if tool_name == "AskUserQuestion":
+        return await _handle_ask_user_question(tool_input, thread_id, hook_type)
+
+    # sensitive path は「常に許可」を無視（毎回確認させる）
+    if not sensitive and thread_id in allowed_tools and tool_name in allowed_tools[thread_id]:
         return web.json_response(make_quick_allow(hook_type))
 
     # Discord にボタン送信
@@ -202,10 +348,15 @@ async def handle_permission_request(request: web.Request) -> web.Response:
         if thread:
             detail = format_tool_detail(tool_name, tool_input)
             view = PermissionView(request_id, tool_name, thread_id, hook_type)
-            await thread.send(
-                f"🔐 **権限リクエスト: `{tool_name}`**\n{detail}",
-                view=view,
-            )
+            if sensitive:
+                header = (
+                    f"⚠️ **センシティブパスへの書き込み要求: `{tool_name}`**\n"
+                    f"（`--dangerously-skip-permissions` でも保護されるパス。"
+                    f"承認するとブリッジが直接書き込みます）"
+                )
+            else:
+                header = f"🔐 **権限リクエスト: `{tool_name}`**"
+            await thread.send(f"{header}\n{detail}", view=view)
     except Exception as e:
         print(f"権限リクエスト送信エラー: {e}")
         # 送信失敗時はクリーンアップして許可
@@ -231,6 +382,7 @@ async def start_hook_server():
     """フックからのリクエストを受けるローカル HTTP サーバーを起動"""
     app = web.Application()
     app.router.add_post("/permission", handle_permission_request)
+    app.router.add_post("/notification", handle_notification)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "127.0.0.1", HOOK_PORT)
@@ -243,6 +395,7 @@ def build_hook_settings() -> str:
     base_dir = Path(__file__).parent.resolve()
     pretooluse_script = str(base_dir / "hook_pretooluse.py")
     permission_script = str(base_dir / "hook_permission_request.py")
+    notification_script = str(base_dir / "hook_notification.py")
     settings = {
         "hooks": {
             "PreToolUse": [{
@@ -257,6 +410,13 @@ def build_hook_settings() -> str:
                     "type": "command",
                     "command": f'"{sys.executable}" "{permission_script}"',
                     "timeout": 600,
+                }],
+            }],
+            "Notification": [{
+                "hooks": [{
+                    "type": "command",
+                    "command": f'"{sys.executable}" "{notification_script}"',
+                    "timeout": 30,
                 }],
             }],
         },
@@ -291,49 +451,135 @@ def strip_ansi(text: str) -> str:
     return re.sub(r"\x1B\[[0-9;]*[a-zA-Z]", "", text)
 
 
-def parse_claude_output(raw: str, err: str, session_id: str | None) -> tuple[str, str | None, list]:
-    """Claude CLIの出力をパースして (応答テキスト, セッションID, 画像リスト) を返す"""
-    print(f"[DEBUG] claude stdout ({len(raw)} chars): {raw[:500]}")
-    if err:
-        print(f"[DEBUG] claude stderr: {err[:300]}")
+def _extract_images_from_blocks(blocks, images: list):
+    """content blocks 配列を再帰的に走査して image ブロックを抽出"""
+    if not isinstance(blocks, list):
+        return
+    for b in blocks:
+        if not isinstance(b, dict):
+            continue
+        btype = b.get("type")
+        if btype == "image":
+            src = b.get("source", {}) or {}
+            if src.get("type") == "base64":
+                try:
+                    data = base64.b64decode(src.get("data", ""))
+                    media = src.get("media_type", "image/png")
+                    ext = media.split("/")[-1] or "png"
+                    images.append((data, f"image_{len(images)}.{ext}"))
+                except Exception as e:
+                    print(f"画像デコードエラー: {e}")
+        elif btype == "tool_result":
+            _extract_images_from_blocks(b.get("content"), images)
 
+
+def parse_stream_events(events: list, stderr: str, session_id: str | None) -> tuple[str, str | None, list]:
+    """stream-json イベントリストから (応答テキスト, セッションID, 画像) を抽出"""
     new_session_id = session_id
-    output = ""
-    images: list[tuple[bytes, str]] = []  # (data, filename)
-    try:
-        data = json.loads(raw)
-        new_session_id = data.get("session_id", session_id)
-        result = data.get("result", "")
-        if isinstance(result, str):
-            output = result
-        elif isinstance(result, list):
-            texts = []
-            for i, block in enumerate(result):
-                if block.get("type") == "text":
-                    texts.append(block.get("text", ""))
-                elif block.get("type") == "image":
-                    source = block.get("source", {})
-                    if source.get("type") == "base64":
-                        try:
-                            img_data = base64.b64decode(source["data"])
-                            ext = source.get("media_type", "image/png").split("/")[-1]
-                            images.append((img_data, f"image_{i}.{ext}"))
-                        except Exception as e:
-                            print(f"画像デコードエラー: {e}")
-            output = "\n".join(texts)
-        else:
-            output = str(result)
-        if not output:
-            output = data.get("text", "") or json.dumps(data, ensure_ascii=False, indent=2)
-    except json.JSONDecodeError:
-        output = strip_ansi(raw) if raw else ""
+    final_text = ""
+    fallback_text_parts: list[str] = []
+    images: list[tuple[bytes, str]] = []
+    is_error = False
+    error_msg = ""
 
-    if not output and err:
-        output = f"エラー: {err}"
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        etype = ev.get("type")
+
+        if etype == "system" and ev.get("subtype") == "init":
+            new_session_id = ev.get("session_id") or new_session_id
+
+        elif etype == "assistant":
+            msg = ev.get("message") or {}
+            content = msg.get("content") if isinstance(msg, dict) else None
+            if isinstance(content, list):
+                for b in content:
+                    if not isinstance(b, dict):
+                        continue
+                    if b.get("type") == "text":
+                        fallback_text_parts.append(b.get("text", "") or "")
+                    elif b.get("type") == "image":
+                        _extract_images_from_blocks([b], images)
+
+        elif etype == "user":
+            # tool_result の中の画像（Read画像、MCPスクショ等）を拾う
+            msg = ev.get("message") or {}
+            content = msg.get("content") if isinstance(msg, dict) else None
+            _extract_images_from_blocks(content, images)
+
+        elif etype == "result":
+            new_session_id = ev.get("session_id") or new_session_id
+            is_error = bool(ev.get("is_error"))
+            r = ev.get("result", "")
+            if isinstance(r, str):
+                final_text = r
+            error_msg = ev.get("error", "") or ""
+
+    output = final_text or "\n".join(p for p in fallback_text_parts if p).strip()
+    if is_error and not output:
+        output = f"エラー: {error_msg or stderr or '不明なエラー'}"
+    if not output and stderr:
+        output = f"エラー: {stderr.strip()[:1500]}"
     if not output and not images:
         output = "（Claude Codeからの応答が空でした。再度試してください）"
 
     return output.strip(), new_session_id, images
+
+
+def _run_claude_subprocess(args: list, env: dict, cwd: str | None):
+    """同期: Claude CLI を起動し stream-json を行単位でパースして events を返す"""
+    proc = subprocess.Popen(
+        args,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        cwd=cwd,
+        bufsize=1,
+    )
+
+    timed_out_flag = [False]
+
+    def _kill_on_timeout():
+        timed_out_flag[0] = True
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+    timer = threading.Timer(HARD_TIMEOUT, _kill_on_timeout)
+    timer.start()
+
+    events: list = []
+    try:
+        for raw_line in iter(proc.stdout.readline, b""):
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                events.append(json.loads(line.decode("utf-8", errors="replace")))
+            except json.JSONDecodeError:
+                continue
+    except Exception as e:
+        print(f"stream-json 読み取りエラー: {e}")
+    finally:
+        timer.cancel()
+
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+
+    stderr_bytes = b""
+    try:
+        stderr_bytes = proc.stderr.read() or b""
+    except Exception:
+        pass
+    stderr = stderr_bytes.decode("utf-8", errors="replace")
+
+    return events, stderr, timed_out_flag[0]
 
 
 async def run_claude(
@@ -343,17 +589,20 @@ async def run_claude(
     thread_title: str | None = None,
     cwd: str | None = None,
 ) -> tuple[str, str | None, list]:
-    """Claude Code CLI を実行して (応答テキスト, セッションID) を返す。"""
-    args = ["claude", "-p", "--output-format", "json"]
+    """Claude Code CLI を stream-json で実行して (応答テキスト, セッションID, 画像) を返す"""
+    args = [
+        "claude", "-p",
+        "--output-format", "stream-json",
+        "--verbose",
+        "--dangerously-skip-permissions",
+    ]
 
-    if SKIP_PERMISSIONS:
-        # 全権限スキップ（フックなし）
-        args.insert(1, "--dangerously-skip-permissions")
-    else:
-        # フックで権限管理（built-in プロンプトは無効化）
-        args.insert(1, "--dangerously-skip-permissions")
-        settings_path = build_hook_settings()
-        args.extend(["--settings", settings_path])
+    # フックは常に登録する。
+    # - SKIP_PERMISSIONS=true でも、sensitive path 書き込み（--dangerously-skip-permissions で
+    #   バイパスできないハードコード保護）を PreToolUse で捕まえて Discord ボタンに出すため。
+    # - 通常ツールの扱いは hook_pretooluse.py 側が BRIDGE_SKIP_PERMISSIONS を見て分岐する。
+    settings_path = build_hook_settings()
+    args.extend(["--settings", settings_path])
 
     if session_id:
         args.extend(["--resume", session_id])
@@ -366,25 +615,9 @@ async def run_claude(
     env.pop("CLAUDECODE", None)
     env["PYTHONIOENCODING"] = "utf-8"
     env["HOOK_PORT"] = str(HOOK_PORT)
+    env["BRIDGE_SKIP_PERMISSIONS"] = "true" if SKIP_PERMISSIONS else "false"
     if thread:
         env["DISCORD_THREAD_ID"] = str(thread.id)
-
-    def _run_subprocess():
-        proc = subprocess.Popen(
-            args,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=env,
-            cwd=cwd,
-        )
-        try:
-            stdout, stderr = proc.communicate(timeout=HARD_TIMEOUT)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            stdout, stderr = proc.communicate()
-            return None, None, True  # timed out
-        return stdout, stderr, False
 
     # ソフトタイムアウト通知用タスク
     placeholder = None
@@ -397,7 +630,7 @@ async def run_claude(
     else:
         notify_task = None
 
-    stdout, stderr, timed_out = await asyncio.to_thread(_run_subprocess)
+    events, stderr, timed_out = await asyncio.to_thread(_run_claude_subprocess, args, env, cwd)
 
     if notify_task and not notify_task.done():
         notify_task.cancel()
@@ -408,9 +641,7 @@ async def run_claude(
             await placeholder.edit(content=msg)
         return msg, session_id, []
 
-    raw = stdout.decode("utf-8", errors="replace").strip()
-    err = stderr.decode("utf-8", errors="replace").strip()
-    output, new_session_id, images = parse_claude_output(raw, err, session_id)
+    output, new_session_id, images = parse_stream_events(events, stderr, session_id)
 
     if placeholder:
         chunks = split_message(output, 2000)
@@ -613,8 +844,8 @@ async def sync_commands(ctx: commands.Context):
 
 @bot.event
 async def on_ready():
-    if not SKIP_PERMISSIONS:
-        await start_hook_server()
+    # sensitive path 保護を Discord に引き出すためフックサーバーは常に必要
+    await start_hook_server()
     synced = await bot.tree.sync()
     print(f"Bot起動: {bot.user} ({len(synced)}個のコマンドを同期)")
     print(f"フォーラムチャンネルID: {FORUM_CHANNEL_ID}")
