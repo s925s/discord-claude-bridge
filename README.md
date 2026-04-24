@@ -17,7 +17,7 @@
 
 </div>
 
-## Overview
+## 概要
 
 Discord のフォーラムチャンネルに投稿するだけで、サーバー上の [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI が実行されるブリッジBotです。スレッドごとにセッションが管理され、会話の文脈を維持したまま継続的にやり取りできます。
 
@@ -35,7 +35,7 @@ graph LR
     style D fill:#2b2d31,color:#e7e9ea,stroke:#5865F2
 ```
 
-## Features
+## 特徴
 
 | 機能 | 説明 |
 |:---:|---|
@@ -50,13 +50,13 @@ graph LR
 | **メッセージ分割** | 2000文字超の応答をコードブロックを壊さずに自動分割 |
 | **アクセス制御** | 許可されたユーザーIDのみ実行可能 |
 
-## Requirements
+## 必要なもの
 
 - **Python 3.11+**
 - **[Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code)** — `claude` コマンドがPATHに通っていること
 - **Discord Bot** — Message Content Intent が有効なBotトークン
 
-## Quick Start
+## インストール
 
 ### 1. インストール
 
@@ -98,7 +98,7 @@ cp .env.example .env
 python bot.py
 ```
 
-## Usage
+## 使い方
 
 ### 基本的な使い方
 
@@ -126,7 +126,7 @@ python bot.py
 |---|---|
 | `!sync` | スラッシュコマンドをDiscordに同期（コマンド追加・変更後に1回実行） |
 
-## Permission Mode
+## 権限モード
 
 `SKIP_PERMISSIONS=false`（デフォルト）の場合、Claude Code がファイル編集やコマンド実行などのツールを使おうとすると、Discordスレッドにボタンが表示されます。
 
@@ -161,7 +161,7 @@ sequenceDiagram
 > 読み取り専用ツール（`Read`, `Glob`, `Grep` 等）は自動的に許可されます。
 > ポートは `HOOK_PORT` 環境変数で変更可能です（デフォルト: `8585`）。
 
-## Security
+## セキュリティ
 
 > **Warning**
 > `SKIP_PERMISSIONS=true` を設定すると、全操作が**確認なしで**実行されます。
@@ -170,6 +170,6 @@ sequenceDiagram
 > - Botを動かすマシン上で実行されるため、そのマシンへのアクセス権と同等のリスクがあります
 > - デフォルトの `false` では、Discord上でツールごとに許可/拒否を選択できます
 
-## License
+## ライセンス
 
 MIT
