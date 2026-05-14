@@ -24,8 +24,8 @@ Discord のフォーラムチャンネルに投稿するだけで、サーバー
 ```mermaid
 graph LR
     A["Discord フォーラム"] -->|メッセージ| B["Bridge Bot"]
-    B -->|"claude -p --output-format json"| C["Claude Code CLI"]
-    C -->|JSON応答| B
+    B -->|"claude -p --output-format stream-json"| C["Claude Code CLI"]
+    C -->|JSONストリーム| B
     B -->|返信| A
     B -->|Embed| D["ログチャンネル"]
 
@@ -76,13 +76,19 @@ cp .env.example .env
 
 | 変数名 | 説明 |
 |---|---|
-| `DISCORD_TOKEN` | Discord Botのトークン |
+| `DISCORD_TOKEN` | Discord Botのトークン（必須） |
 | `ALLOWED_USERS` | 実行を許可するユーザーID（カンマ区切り） |
-| `FORUM_CHANNEL_ID` | プロンプトを受け付けるフォーラムチャンネルのID |
-| `LOG_CHANNEL_ID` | 実行ログを送信するチャンネルのID |
-| `GUILD_ID` | BotがいるサーバーのID |
+| `FORUM_CHANNEL_ID` | プロンプトを受け付けるフォーラムチャンネルのID（必須） |
+| `LOG_CHANNEL_ID` | 実行ログを送信するチャンネルのID（`0` で無効） |
+| `GUILD_ID` | BotがいるサーバーのID（`0` で全ギルド対応） |
 | `SKIP_PERMISSIONS` | `true` で全操作を自動許可（デフォルト: `false`） |
 | `HOOK_PORT` | 権限リクエスト用の内部ポート（デフォルト: `8585`） |
+| `CLAUDE_BIN` | `claude` 実行ファイル名/絶対パス（デフォルト: `claude`） |
+| `PERMISSION_MODE` | `--permission-mode` 値（`acceptEdits` / `plan` / `auto` / `bypassPermissions` / 空） |
+| `MAX_TURNS` | 1ターンの最大エージェント実行回数（空で無制限） |
+| `MAX_BUDGET_USD` | 1ターンの最大コスト USD（空で無制限） |
+| `SOFT_TIMEOUT` / `HARD_TIMEOUT` | 進捗通知 / 強制終了の秒数（既定 600 / 3600） |
+| `MAX_CONCURRENT_RUNS` | スレッド単位の並列実行上限（既定 5） |
 
 ### 3. Discord Botの準備
 
@@ -145,12 +151,13 @@ sequenceDiagram
     Hook->>CC: 許可 or ブロック
 ```
 
-2つのフックで全ての確認をカバーします：
+3つのフックで全ての確認・通知をカバーします：
 
 | フック | 発火タイミング |
 |:---:|---|
-| **PreToolUse** | 全ツール実行前（読み取り専用ツールは自動許可） |
+| **PreToolUse** | 全ツール実行前。読み取り専用ツールは自動許可。`AskUserQuestion` は選択肢ボタンに変換 |
 | **PermissionRequest** | Claude Codeの権限確認ダイアログ表示時 |
+| **Notification** | `permission_prompt` / `idle_prompt` / `elicitation_*` などの通知を該当スレッドに転送 |
 
 | ボタン | 動作 |
 |:---:|---|
@@ -164,11 +171,25 @@ sequenceDiagram
 ## セキュリティ
 
 > **Warning**
-> `SKIP_PERMISSIONS=true` を設定すると、全操作が**確認なしで**実行されます。
+> `SKIP_PERMISSIONS=true` を設定すると、`--dangerously-skip-permissions` フラグが付与され、全操作が**確認なしで**実行されます。
 >
 > - 必ず `ALLOWED_USERS` を信頼できるユーザーのみに限定してください
 > - Botを動かすマシン上で実行されるため、そのマシンへのアクセス権と同等のリスクがあります
-> - デフォルトの `false` では、Discord上でツールごとに許可/拒否を選択できます
+> - `SKIP_PERMISSIONS=true` でも、`.claude/` / `.git/` / `.env` / `.ssh/` / `.vscode/` / `.idea/` / `.husky/` などのセンシティブパスへの書き込みは Discord ボタンで再確認されます
+
+## トラブルシューティング
+
+| 症状 | 原因と対処 |
+|---|---|
+| 起動時に `DISCORD_TOKEN が未設定です` | `.env` をコピーして `DISCORD_TOKEN` を埋める |
+| 起動時に `PrivilegedIntentsRequired` | Discord Developer Portal で **Message Content Intent** を有効化 |
+| 起動時に `フックサーバー起動失敗 (port 8585)` | 既存プロセスがポートを掴んでいる。`HOOK_PORT` を別番号に |
+| 応答が `エラー: command not found` 系 | `claude` が PATH にない。`CLAUDE_BIN` に絶対パス指定 |
+| `/resume <id>` で「ローカルに見つかりません」警告 | セッションファイルがそのマシンにない。同期し直すか正しいセッションIDを指定 |
+| ボタンを押しても反応なし | 10分タイムアウト超過。フックは「許可」で抜けてClaudeは継続実行する |
+| `タイムアウトしました（60分超過）` | `HARD_TIMEOUT` を増やすか、プロンプトを分割 |
+| `Discord HTTP エラー: 429` | レート制限。短時間に大量リクエストしすぎ |
+| `画像が大きすぎ, スキップ` | Discord の 25MB 制限超過。画像出力を縮小 |
 
 ## ライセンス
 

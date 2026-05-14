@@ -25,8 +25,8 @@ A bridge bot that executes [Claude Code](https://docs.anthropic.com/en/docs/clau
 ```mermaid
 graph LR
     A["Discord Forum"] -->|Message| B["Bridge Bot"]
-    B -->|"claude -p --output-format json"| C["Claude Code CLI"]
-    C -->|JSON Response| B
+    B -->|"claude -p --output-format stream-json"| C["Claude Code CLI"]
+    C -->|JSON Stream| B
     B -->|Reply| A
     B -->|Embed| D["Log Channel"]
 
@@ -77,13 +77,19 @@ Edit `.env` with the following:
 
 | Variable | Description |
 |---|---|
-| `DISCORD_TOKEN` | Discord bot token |
+| `DISCORD_TOKEN` | Discord bot token (required) |
 | `ALLOWED_USERS` | Allowed user IDs (comma-separated) |
-| `FORUM_CHANNEL_ID` | Forum channel ID for receiving prompts |
-| `LOG_CHANNEL_ID` | Channel ID for execution logs |
-| `GUILD_ID` | Server (guild) ID |
+| `FORUM_CHANNEL_ID` | Forum channel ID for receiving prompts (required) |
+| `LOG_CHANNEL_ID` | Channel ID for execution logs (`0` to disable) |
+| `GUILD_ID` | Server (guild) ID (`0` for all guilds) |
 | `SKIP_PERMISSIONS` | Set `true` to auto-allow all operations (default: `false`) |
 | `HOOK_PORT` | Internal port for permission requests (default: `8585`) |
+| `CLAUDE_BIN` | `claude` executable name/path (default: `claude`) |
+| `PERMISSION_MODE` | `--permission-mode` value (`acceptEdits` / `plan` / `auto` / `bypassPermissions` / empty) |
+| `MAX_TURNS` | Max agent turns per request (empty = unlimited) |
+| `MAX_BUDGET_USD` | Max USD cost per request (empty = unlimited) |
+| `SOFT_TIMEOUT` / `HARD_TIMEOUT` | Progress notification / force-kill seconds (default 600 / 3600) |
+| `MAX_CONCURRENT_RUNS` | Max parallel runs across threads (default 5) |
 
 ### 3. Discord Bot Setup
 
@@ -146,12 +152,13 @@ sequenceDiagram
     Hook->>CC: Allow or Block
 ```
 
-Two hooks cover all permission checks:
+Three hooks cover all permission checks and notifications:
 
 | Hook | Trigger |
 |:---:|---|
-| **PreToolUse** | Before every tool execution (read-only tools are auto-allowed) |
+| **PreToolUse** | Before every tool execution. Read-only tools auto-allowed. `AskUserQuestion` becomes choice buttons |
 | **PermissionRequest** | When Claude Code's permission dialog would appear |
+| **Notification** | Forwards `permission_prompt` / `idle_prompt` / `elicitation_*` events to the thread |
 
 | Button | Action |
 |:---:|---|
@@ -165,11 +172,25 @@ Two hooks cover all permission checks:
 ## Security
 
 > **Warning**
-> Setting `SKIP_PERMISSIONS=true` will execute all operations **without confirmation**.
+> Setting `SKIP_PERMISSIONS=true` passes `--dangerously-skip-permissions` and executes all operations **without confirmation**.
 >
 > - Always limit `ALLOWED_USERS` to trusted users only
 > - The bot runs on the host machine, so it has equivalent access rights
-> - The default `false` lets you approve/deny each tool via Discord
+> - Even with `SKIP_PERMISSIONS=true`, writes to sensitive paths (`.claude/`, `.git/`, `.env`, `.ssh/`, `.vscode/`, `.idea/`, `.husky/`) still require Discord confirmation
+
+## Troubleshooting
+
+| Symptom | Cause / Fix |
+|---|---|
+| `DISCORD_TOKEN が未設定です` at startup | Copy `.env.example` to `.env` and set `DISCORD_TOKEN` |
+| `PrivilegedIntentsRequired` at startup | Enable **Message Content Intent** in the Discord Developer Portal |
+| `フックサーバー起動失敗 (port 8585)` | Another process owns the port. Change `HOOK_PORT` |
+| Response shows `command not found` | `claude` is not on PATH. Set `CLAUDE_BIN` to an absolute path |
+| `/resume <id>` warns "not found locally" | Session file isn't on this machine. Re-sync or use the correct ID |
+| Buttons don't respond | 10-min interaction timeout exceeded. Hook auto-allows so Claude keeps running |
+| `タイムアウトしました（60分超過）` | Raise `HARD_TIMEOUT` or split the prompt |
+| `Discord HTTP エラー: 429` | Rate-limited. Reduce request rate |
+| `画像が大きすぎ, スキップ` | Image exceeds Discord's 25MB limit. Shrink the output |
 
 ## License
 

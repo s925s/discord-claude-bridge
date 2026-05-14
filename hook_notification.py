@@ -1,20 +1,28 @@
 #!/usr/bin/env python3
 """Notification hook: Claude Code の通知イベントを Discord に転送する。
 
-permission_prompt / idle_prompt / elicitation_dialog などを受信し、
+permission_prompt / idle_prompt / elicitation_dialog /
+elicitation_complete / elicitation_response / auth_success などを受信し、
 Discord の該当スレッドにメッセージとして転送する。
-ブロッキング呼び出しではないので即座に空レスポンスを返す。
 """
 import os
 import sys
 import json
+import socket
 import urllib.request
+import urllib.error
 
 
 def main():
     try:
-        input_data = json.load(sys.stdin)
+        raw = sys.stdin.read()
+        input_data = json.loads(raw) if raw.strip() else {}
+    except (json.JSONDecodeError, ValueError) as e:
+        print(f"hook_notification: stdin parse error: {e}", file=sys.stderr)
+        print("{}")
+        sys.exit(0)
 
+    try:
         port = os.environ.get("HOOK_PORT", "8585")
         thread_id = os.environ.get("DISCORD_THREAD_ID", "")
 
@@ -35,13 +43,14 @@ def main():
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
                 resp.read()
-        except Exception as e:
-            print(f"notification post error: {e}", file=sys.stderr)
+        except (urllib.error.URLError, socket.timeout, ConnectionError) as e:
+            # bot 落ちてても通知転送だけだから黙って続行
+            print(f"hook_notification: post error: {e}", file=sys.stderr)
 
-        print(json.dumps({}))
+        print("{}")
     except Exception as e:
-        print(f"hook_notification error: {e}", file=sys.stderr)
-        print(json.dumps({}))
+        print(f"hook_notification unexpected error: {e}", file=sys.stderr)
+        print("{}")
     sys.exit(0)
 
 
