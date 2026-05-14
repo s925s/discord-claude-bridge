@@ -1,4 +1,7 @@
+import atexit
 import os
+import secrets
+import signal
 import sys
 import json
 import asyncio
@@ -6,6 +9,7 @@ import re
 import shutil
 import subprocess
 import threading
+import weakref
 
 # Windows: aiodns が SelectorEventLoop を要求する問題を回避
 if sys.platform == "win32":
@@ -71,9 +75,47 @@ if not ALLOWED_USERS:
 SKIP_PERMISSIONS = os.getenv("SKIP_PERMISSIONS", "false").lower() in ("true", "1", "yes")
 HOOK_PORT = int(os.getenv("HOOK_PORT", "8585"))
 CLAUDE_BIN = os.getenv("CLAUDE_BIN", "claude")
-PERMISSION_MODE = os.getenv("PERMISSION_MODE", "").strip()  # 任意: default/acceptEdits/plan/auto/bypassPermissions
-MAX_TURNS = os.getenv("MAX_TURNS", "").strip()
-MAX_BUDGET_USD = os.getenv("MAX_BUDGET_USD", "").strip()
+
+# --permission-mode に渡す値。空なら未指定（claude のデフォルト）
+VALID_PERMISSION_MODES = {"", "default", "acceptEdits", "plan", "auto", "dontAsk", "bypassPermissions"}
+PERMISSION_MODE = os.getenv("PERMISSION_MODE", "").strip()
+if PERMISSION_MODE not in VALID_PERMISSION_MODES:
+    raise SystemExit(
+        f"PERMISSION_MODE が不正です: {PERMISSION_MODE!r}。"
+        f"有効値: {sorted(VALID_PERMISSION_MODES)}"
+    )
+if SKIP_PERMISSIONS and PERMISSION_MODE:
+    log.warning(
+        "SKIP_PERMISSIONS=true と PERMISSION_MODE=%s が同時設定されています。"
+        "--dangerously-skip-permissions が優先され、PERMISSION_MODE は無視されます",
+        PERMISSION_MODE,
+    )
+
+
+def _validate_numeric_env(name: str, value: str, allow_float: bool = False) -> str:
+    if not value:
+        return ""
+    try:
+        v = float(value) if allow_float else int(value)
+    except ValueError:
+        raise SystemExit(f"{name} は数値である必要があります（現値: {value!r}）")
+    if v < 0:
+        raise SystemExit(f"{name} は 0 以上である必要があります（現値: {value!r}）")
+    return value
+
+
+MAX_TURNS = _validate_numeric_env("MAX_TURNS", os.getenv("MAX_TURNS", "").strip())
+MAX_BUDGET_USD = _validate_numeric_env("MAX_BUDGET_USD", os.getenv("MAX_BUDGET_USD", "").strip(), allow_float=True)
+
+# hook → bot HTTP の共有秘密。ローカル他プロセスからの偽リクエスト遮断用
+HOOK_AUTH_TOKEN = secrets.token_hex(16)
+HOOK_AUTH_HEADER = "X-Bridge-Auth"
+
+SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_\-]{1,128}$")
+
+
+def is_valid_session_id(sid: str) -> bool:
+    return bool(sid) and bool(SESSION_ID_RE.match(sid))
 
 SESSIONS_FILE = Path(__file__).parent / "sessions.json"
 TEMP_DIR = Path(tempfile.gettempdir()) / "discord-claude-bridge"
@@ -88,6 +130,29 @@ STREAM_LINE_BUFSIZE = 16 * 1024 * 1024  # 1行あたり最大16MB（画像 base6
 TAG_RUNNING = "実行中"
 TAG_COMPLETED = "完了"
 TAG_ERROR = "エラー"
+
+# 走行中の Claude subprocess を追跡（bot 終了時に確実に kill するため）
+_active_procs: "weakref.WeakSet[subprocess.Popen]" = weakref.WeakSet()
+_active_procs_lock = threading.Lock()
+
+
+def _register_proc(proc: subprocess.Popen):
+    with _active_procs_lock:
+        _active_procs.add(proc)
+
+
+def _kill_all_procs():
+    with _active_procs_lock:
+        procs = list(_active_procs)
+    for p in procs:
+        if p.poll() is None:
+            try:
+                p.kill()
+            except Exception:
+                pass
+
+
+atexit.register(_kill_all_procs)
 
 
 # ==============================
@@ -106,7 +171,14 @@ def format_tool_detail(tool_name: str, tool_input: dict) -> str:
     if tool_name == "Bash":
         cmd = tool_input.get("command", "")
         return f"```bash\n{cmd[:800]}\n```"
-    if tool_name in ("Edit", "Write", "MultiEdit"):
+    if tool_name == "Write":
+        path = tool_input.get("file_path", "")
+        content = tool_input.get("content", "")
+        parts = [f"**ファイル:** `{path}`"]
+        if content:
+            parts.append(f"```\n{content[:600]}\n```")
+        return "\n".join(parts)
+    if tool_name in ("Edit", "MultiEdit"):
         path = tool_input.get("file_path", "")
         old = tool_input.get("old_string", "")
         new = tool_input.get("new_string", "")
@@ -211,6 +283,16 @@ class PermissionView(discord.ui.View):
             # interaction 期限切れや既応答済み
             log.warning("ボタン応答編集失敗: %s", e)
 
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        # ALLOWED_USERS 以外のクリックを拒否
+        if str(interaction.user.id) not in ALLOWED_USERS:
+            try:
+                await interaction.response.send_message("権限がありません", ephemeral=True)
+            except (discord.NotFound, discord.HTTPException):
+                pass
+            return False
+        return True
+
     @discord.ui.button(label="許可", style=discord.ButtonStyle.green, emoji="✅")
     async def allow_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not self._resolve(self._make_allow()):
@@ -259,6 +341,15 @@ class QuestionView(discord.ui.View):
             )
             btn.callback = self._make_callback(label)
             self.add_item(btn)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if str(interaction.user.id) not in ALLOWED_USERS:
+            try:
+                await interaction.response.send_message("権限がありません", ephemeral=True)
+            except (discord.NotFound, discord.HTTPException):
+                pass
+            return False
+        return True
 
     def _build_response(self, answer: str) -> dict:
         reason = f"User answered: {answer}. Treat this as the user's answer and continue."
@@ -391,6 +482,17 @@ NOTIFICATION_ICONS = {
 }
 
 
+@web.middleware
+async def auth_middleware(request: web.Request, handler):
+    # /health は認証不要
+    if request.path == "/health":
+        return await handler(request)
+    token = request.headers.get(HOOK_AUTH_HEADER, "")
+    if not secrets.compare_digest(token, HOOK_AUTH_TOKEN):
+        return web.json_response({"error": "unauthorized"}, status=401)
+    return await handler(request)
+
+
 async def handle_notification(request: web.Request) -> web.Response:
     try:
         data = await request.json()
@@ -491,8 +593,13 @@ async def handle_health(_request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "user": str(bot.user) if bot.is_ready() else None})
 
 
+# AppRunner を保持して bot 終了時に cleanup できるようにする
+_hook_runner: web.AppRunner | None = None
+
+
 async def start_hook_server():
-    app = web.Application()
+    global _hook_runner
+    app = web.Application(middlewares=[auth_middleware])
     app.router.add_post("/permission", handle_permission_request)
     app.router.add_post("/notification", handle_notification)
     app.router.add_get("/health", handle_health)
@@ -506,7 +613,18 @@ async def start_hook_server():
             f"フックサーバー起動失敗 (port {HOOK_PORT}): {e}\n"
             f"既存プロセスがポートを掴んでいるか、HOOK_PORT を別の番号に変えてください"
         )
+    _hook_runner = runner
     log.info("Hook サーバー起動: http://127.0.0.1:%d", HOOK_PORT)
+
+
+async def stop_hook_server():
+    global _hook_runner
+    if _hook_runner is not None:
+        try:
+            await _hook_runner.cleanup()
+        except Exception as e:
+            log.warning("フックサーバー cleanup 失敗: %s", e)
+        _hook_runner = None
 
 
 def build_hook_settings() -> str:
@@ -615,13 +733,15 @@ def parse_stream_events(events: list, stderr: str, session_id: str | None) -> tu
     images: list[tuple[bytes, str]] = []
     is_error = False
     error_msg = ""
+    result_subtype = ""
 
     for ev in events:
         if not isinstance(ev, dict):
             continue
         etype = ev.get("type")
 
-        if etype == "system" and ev.get("subtype") == "init":
+        if etype == "system":
+            # init 以外の system サブタイプ (api_retry/compact_boundary 等) でも session_id を更新
             new_session_id = ev.get("session_id") or new_session_id
 
         elif etype == "assistant":
@@ -635,6 +755,9 @@ def parse_stream_events(events: list, stderr: str, session_id: str | None) -> tu
                         fallback_text_parts.append(b.get("text", "") or "")
                     elif b.get("type") == "image":
                         _extract_images_from_blocks([b], images)
+            elif isinstance(content, str):
+                # SDK 仕様で content が string になる場合があるので拾う
+                fallback_text_parts.append(content)
 
         elif etype == "user":
             msg = ev.get("message") or {}
@@ -644,12 +767,19 @@ def parse_stream_events(events: list, stderr: str, session_id: str | None) -> tu
         elif etype == "result":
             new_session_id = ev.get("session_id") or new_session_id
             is_error = bool(ev.get("is_error"))
+            result_subtype = ev.get("subtype", "") or ""
             r = ev.get("result", "")
             if isinstance(r, str):
                 final_text = r
             error_msg = ev.get("error", "") or ""
 
         # tool_use / tool_result / partial_message / hook_event / その他未知タイプは無視
+
+    # subtype が error_* なら成功でも実質失敗として扱う
+    if result_subtype.startswith("error_"):
+        is_error = True
+        if not error_msg:
+            error_msg = f"Claude Code: {result_subtype}"
 
     output = final_text or "\n".join(p for p in fallback_text_parts if p).strip()
     if is_error and not output:
@@ -698,6 +828,7 @@ def _run_claude_subprocess(args: list, env: dict, cwd: str | None):
     except OSError as e:
         return [], f"claude 起動失敗: {e}", False
 
+    _register_proc(proc)
     timed_out_flag = [False]
 
     def _kill_on_timeout():
@@ -730,7 +861,14 @@ def _run_claude_subprocess(args: list, env: dict, cwd: str | None):
     except (OSError, ValueError) as e:
         log.warning("stream-json 読み取りエラー: %s", e)
     finally:
-        timer.cancel()
+        # cancel() の戻り値: True=キャンセル成功, False=既にfired
+        # fired 後の自己cancel と本物の timeout を区別する
+        if not timer.cancel():
+            # 既に _kill_on_timeout に入っているか実行済み
+            pass
+        else:
+            # キャンセル成功 = タイマー fired していない = 正常終了
+            timed_out_flag[0] = False
         try:
             proc.stdout.close()
         except Exception:
@@ -743,15 +881,21 @@ def _run_claude_subprocess(args: list, env: dict, cwd: str | None):
             proc.kill()
         except Exception:
             pass
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            pass
+        # 2回目の wait は OS が回収するまでバックグラウンドで待つ
+        threading.Thread(target=lambda: _safe_wait(proc), daemon=True).start()
 
-    stderr_thread.join(timeout=3)
+    # subprocess が完全に終わってれば stderr は EOF なのでブロックしない
+    stderr_thread.join(timeout=10)
     stderr = b"".join(stderr_chunks).decode("utf-8", errors="replace")
 
     return events, stderr, timed_out_flag[0]
+
+
+def _safe_wait(proc: subprocess.Popen):
+    try:
+        proc.wait()
+    except Exception:
+        pass
 
 
 def _build_claude_args(prompt: str, session_id: str | None, settings_path: str) -> list[str]:
@@ -795,6 +939,7 @@ async def run_claude(
     env["PYTHONIOENCODING"] = "utf-8"
     env["HOOK_PORT"] = str(HOOK_PORT)
     env["BRIDGE_SKIP_PERMISSIONS"] = "true" if SKIP_PERMISSIONS else "false"
+    env["BRIDGE_AUTH_TOKEN"] = HOOK_AUTH_TOKEN
     if thread:
         env["DISCORD_THREAD_ID"] = str(thread.id)
 
@@ -992,11 +1137,12 @@ async def enqueue_for_thread(
     message: discord.Message,
     prompt: str,
     cwd: str | None = None,
+    image_paths: list[Path] | None = None,
 ):
     tid = thread.id
     async with _worker_lock:
         q = thread_queues.setdefault(tid, asyncio.Queue())
-        q.put_nowait((thread, message, prompt, cwd))
+        q.put_nowait((thread, message, prompt, cwd, image_paths or []))
         worker = thread_workers.get(tid)
         if worker is None or worker.done():
             thread_workers[tid] = asyncio.create_task(process_thread(tid))
@@ -1007,12 +1153,12 @@ async def process_thread(tid: int):
     while True:
         while True:
             try:
-                thread, message, prompt, cwd = q.get_nowait()
+                thread, message, prompt, cwd, image_paths = q.get_nowait()
             except asyncio.QueueEmpty:
                 break
             async with concurrency_sem:
                 try:
-                    await _run_one(thread, message, prompt, cwd)
+                    await _run_one(thread, message, prompt, cwd, image_paths)
                 except Exception:
                     log.exception("ワーカー実行中に想定外エラー")
                 finally:
@@ -1021,6 +1167,8 @@ async def process_thread(tid: int):
             if q.empty():
                 thread_queues.pop(tid, None)
                 thread_workers.pop(tid, None)
+                # 長期運用で per-thread の allowed_tools / 並列キューが残らないようクリア
+                allowed_tools.pop(str(tid), None)
                 return
 
 
@@ -1029,6 +1177,7 @@ async def _run_one(
     message: discord.Message,
     prompt: str,
     cwd: str | None,
+    image_paths: list[Path] | None = None,
 ):
     status = TAG_RUNNING
     result = ""
@@ -1047,6 +1196,10 @@ async def _run_one(
         async def _do_work():
             thread_key = str(thread.id)
             session_id = await get_session_id(thread_key)
+            # session_id が不正形式または .jsonl が存在しなければ resume を諦めて新規開始
+            if session_id and not is_valid_session_id(session_id):
+                log.warning("不正形式の session_id を破棄: %s", session_id)
+                session_id = None
             run_cwd = cwd or (find_session_cwd(session_id) if session_id else None) or str(Path.home())
             result_inner, new_session_id, images = await run_claude(
                 prompt, session_id, thread, thread.name, cwd=run_cwd,
@@ -1072,6 +1225,8 @@ async def _run_one(
         status = TAG_ERROR
         await safe_send(thread, f"エラーが発生しました: {e}")
     finally:
+        if image_paths:
+            cleanup_attachments(image_paths)
         await set_thread_tag(thread, status)
         await send_log(
             thread.guild, str(message.author),
@@ -1133,10 +1288,18 @@ async def on_ready():
 async def download_attachments(message: discord.Message) -> list[Path]:
     downloaded = []
     for att in message.attachments:
-        ext = Path(att.filename).suffix.lower()
+        # API直叩きで `../` 等が来てもパストラバーサルを許さない
+        safe_name = Path(att.filename).name
+        ext = Path(safe_name).suffix.lower()
         if ext not in IMAGE_EXTENSIONS:
             continue
-        save_path = TEMP_DIR / f"{message.id}_{att.filename}"
+        save_path = TEMP_DIR / f"{message.id}_{safe_name}"
+        # 念のため save_path が TEMP_DIR 配下に収まっているか再検証
+        try:
+            save_path.resolve().relative_to(TEMP_DIR.resolve())
+        except ValueError:
+            log.warning("save_path が TEMP_DIR 外: %s", save_path)
+            continue
         try:
             await att.save(save_path)
             downloaded.append(save_path)
@@ -1144,6 +1307,14 @@ async def download_attachments(message: discord.Message) -> list[Path]:
         except (discord.HTTPException, OSError) as e:
             log.warning("画像ダウンロードエラー (%s): %s", att.filename, e)
     return downloaded
+
+
+def cleanup_attachments(paths: list[Path]):
+    for p in paths:
+        try:
+            p.unlink(missing_ok=True)
+        except OSError as e:
+            log.warning("一時画像削除失敗 (%s): %s", p, e)
 
 
 def decode_project_path(encoded: str) -> str | None:
@@ -1175,7 +1346,7 @@ def decode_project_path(encoded: str) -> str | None:
 
 
 def find_session_cwd(session_id: str) -> str | None:
-    if not session_id:
+    if not session_id or not is_valid_session_id(session_id):
         return None
     proj_dir = Path.home() / ".claude" / "projects"
     if not proj_dir.exists():
@@ -1192,6 +1363,19 @@ def find_session_cwd(session_id: str) -> str | None:
     except OSError as e:
         log.warning("プロジェクトディレクトリ走査失敗: %s", e)
     return None
+
+
+def _encode_home_path() -> str:
+    """`Path.home()` を Claude Code のプロジェクトディレクトリ命名規則でエンコードした文字列を返す。
+    例: C:\\Users\\user → C--Users-user, /home/user → -home-user
+    """
+    home = str(Path.home())
+    if sys.platform == "win32" and len(home) > 1 and home[1] == ":":
+        drive, rest = home[0], home[2:]
+        encoded = drive + "--" + rest.replace("\\", "-").replace("/", "-")
+    else:
+        encoded = home.replace("/", "-")
+    return encoded.lstrip("-")  # 先頭ハイフン除去
 
 
 def get_recent_sessions(limit: int = 10, exclude_discord: bool = False) -> list[dict]:
@@ -1212,6 +1396,9 @@ def get_recent_sessions(limit: int = 10, exclude_discord: bool = False) -> list[
         log.warning("プロジェクトディレクトリ列挙失敗: %s", e)
         return []
 
+    home_encoded = _encode_home_path()
+    home_prefix_with_dash = home_encoded + "-"
+
     for d in proj_iter:
         if not d.is_dir():
             continue
@@ -1230,7 +1417,13 @@ def get_recent_sessions(limit: int = 10, exclude_discord: bool = False) -> list[
             except OSError:
                 continue
             dt = datetime.fromtimestamp(mtime).strftime("%m/%d %H:%M")
-            project = d.name.replace("C--Users-user-", "").replace("C--Users-user", "(home)")
+            # ホーム配下のプロジェクトはホーム部分を省略表示
+            if d.name == home_encoded:
+                project = "(home)"
+            elif d.name.startswith(home_prefix_with_dash):
+                project = d.name[len(home_prefix_with_dash):]
+            else:
+                project = d.name
 
             first_msg = ""
             try:
@@ -1395,6 +1588,12 @@ async def resume_session(interaction: discord.Interaction, session_id: str, titl
     await interaction.response.defer(thinking=True)
 
     session_id = session_id.strip()
+    if not is_valid_session_id(session_id):
+        await interaction.followup.send(
+            f"❌ session_id の形式が不正です: `{session_id}`",
+            ephemeral=True,
+        )
+        return
     if not find_session_cwd(session_id):
         await interaction.followup.send(
             f"⚠️ セッション `{session_id}` がローカルに見つかりません。"
@@ -1445,9 +1644,11 @@ async def on_message(message: discord.Message):
         prompt += f"\n\n[添付画像（Readツールで閲覧可能）]\n{paths_str}"
 
     if not prompt.strip() or prompt.startswith("!"):
+        # 画像だけ送って空テキスト/コマンド先頭メッセージは処理しない → 一時画像を即削除
+        cleanup_attachments(image_paths)
         return
 
-    await enqueue_for_thread(message.channel, message, prompt)
+    await enqueue_for_thread(message.channel, message, prompt, image_paths=image_paths)
 
 
 @bot.event

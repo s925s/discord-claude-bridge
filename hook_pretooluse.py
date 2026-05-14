@@ -44,7 +44,15 @@ SENSITIVE_BASENAMES = {
 def is_sensitive_path(path: str) -> bool:
     if not path:
         return False
-    p = path.replace("\\", "/").lower()
+    # nullbyte 含むパスは念のため sensitive 扱い（open() でも ValueError になるが先回り）
+    if "\x00" in path:
+        return True
+    # 正規化して `..` や `.` を解消してから判定
+    try:
+        normalized = os.path.normpath(path)
+    except (ValueError, TypeError):
+        normalized = path
+    p = normalized.replace("\\", "/").lower()
     parts = [seg for seg in p.split("/") if seg]
     for seg in parts[:-1]:
         if seg in SENSITIVE_DIR_NAMES:
@@ -132,11 +140,15 @@ def perform_write(tool_name: str, tool_input: dict) -> str:
 
 def ask_bot(payload: dict, timeout: int = 600) -> dict:
     port = os.environ.get("HOOK_PORT", "8585")
+    token = os.environ.get("BRIDGE_AUTH_TOKEN", "")
     data = json.dumps(payload).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["X-Bridge-Auth"] = token
     req = urllib.request.Request(
         f"http://127.0.0.1:{port}/permission",
         data=data,
-        headers={"Content-Type": "application/json"},
+        headers=headers,
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         body = resp.read().decode("utf-8", errors="replace")

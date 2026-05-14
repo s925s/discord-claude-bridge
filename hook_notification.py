@@ -24,6 +24,7 @@ def main():
 
     try:
         port = os.environ.get("HOOK_PORT", "8585")
+        token = os.environ.get("BRIDGE_AUTH_TOKEN", "")
         thread_id = os.environ.get("DISCORD_THREAD_ID", "")
 
         payload = json.dumps({
@@ -34,10 +35,13 @@ def main():
             "session_id": input_data.get("session_id", ""),
         }).encode("utf-8")
 
+        headers = {"Content-Type": "application/json"}
+        if token:
+            headers["X-Bridge-Auth"] = token
         req = urllib.request.Request(
             f"http://127.0.0.1:{port}/notification",
             data=payload,
-            headers={"Content-Type": "application/json"},
+            headers=headers,
         )
 
         try:
