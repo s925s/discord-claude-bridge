@@ -94,6 +94,10 @@ def perform_write(tool_name: str, tool_input: dict) -> str:
 
     if tool_name == "Write":
         content = tool_input.get("content", "")
+        if content is None:
+            content = ""
+        if not isinstance(content, str):
+            content = str(content)
         parent = os.path.dirname(file_path)
         if parent:
             os.makedirs(parent, exist_ok=True)
@@ -234,7 +238,8 @@ def main():
                             f"do NOT retry this tool call. Continue with the next step."
                         ),
                     ))
-                except (OSError, ValueError) as e:
+                except (OSError, ValueError, TypeError) as e:
+                    # TypeError は content が None 等で f.write(None) になったケース
                     emit(make_response("deny", f"Bridge 直接書き込み失敗: {e}"))
             else:
                 emit(make_response("deny", reason or "ユーザーが Discord で拒否しました"))

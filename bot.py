@@ -21,7 +21,7 @@ import io
 import tempfile
 import logging
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 
 # Windows cp932 で絵文字が encode できない問題を回避
 try:
@@ -608,7 +608,8 @@ async def handle_permission_request(request: web.Request) -> web.Response:
 
 
 async def handle_health(_request: web.Request) -> web.Response:
-    return web.json_response({"ok": True, "user": str(bot.user) if bot.is_ready() else None})
+    # bot.user 等は出さない（認証無しエンドポイントなので情報漏洩を最小化）
+    return web.json_response({"ok": True, "ready": bot.is_ready()})
 
 
 # AppRunner を保持して bot 終了時に cleanup できるようにする
@@ -616,7 +617,11 @@ _hook_runner: web.AppRunner | None = None
 
 
 async def start_hook_server():
+    """フックサーバーを起動。on_ready の再発火（gateway 再接続）で二重起動しないようガードする。"""
     global _hook_runner
+    if _hook_runner is not None:
+        # 既に起動済み
+        return
     app = web.Application(middlewares=[auth_middleware])
     app.router.add_post("/permission", handle_permission_request)
     app.router.add_post("/notification", handle_notification)
@@ -627,9 +632,12 @@ async def start_hook_server():
         site = web.TCPSite(runner, "127.0.0.1", HOOK_PORT)
         await site.start()
     except OSError as e:
+        await runner.cleanup()
         raise SystemExit(
             f"フックサーバー起動失敗 (port {HOOK_PORT}): {e}\n"
             f"既存プロセスがポートを掴んでいるか、HOOK_PORT を別の番号に変えてください"
+            + (f"\nLinux で HOOK_PORT={HOOK_PORT} は特権ポートです。1024 以上を使ってください"
+               if HOOK_PORT < 1024 else "")
         )
     _hook_runner = runner
     log.info("Hook サーバー起動: http://127.0.0.1:%d", HOOK_PORT)
@@ -1151,7 +1159,8 @@ async def send_log(guild: discord.Guild, user: str, thread_name: str, prompt: st
                 TAG_COMPLETED: discord.Color.green(),
                 TAG_ERROR: discord.Color.red(),
             }.get(status, discord.Color.greyple()),
-            timestamp=datetime.now(),
+            # Discord は UTC naive を UTC と解釈する。aware にして渡し、TZ ずれを防ぐ
+            timestamp=datetime.now(timezone.utc),
         )
         embed.add_field(name="ユーザー", value=user, inline=True)
         embed.add_field(name="時刻", value=now, inline=True)
@@ -1218,7 +1227,12 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-MAX_CONCURRENT_RUNS = int(os.getenv("MAX_CONCURRENT_RUNS", "5"))
+try:
+    MAX_CONCURRENT_RUNS = int(os.getenv("MAX_CONCURRENT_RUNS", "5"))
+except ValueError:
+    raise SystemExit(f"MAX_CONCURRENT_RUNS は整数である必要があります: {os.getenv('MAX_CONCURRENT_RUNS')!r}")
+if MAX_CONCURRENT_RUNS < 1:
+    raise SystemExit(f"MAX_CONCURRENT_RUNS は 1 以上必要 (現値: {MAX_CONCURRENT_RUNS})。0/負は全ワーカーが詰みます")
 
 thread_queues: dict[int, asyncio.Queue] = {}
 thread_workers: dict[int, asyncio.Task] = {}
@@ -1295,11 +1309,6 @@ async def _run_one(
             thread.name, prompt, "", TAG_RUNNING,
         )
 
-        try:
-            typing_ctx = thread.typing()
-        except discord.Forbidden:
-            typing_ctx = None
-
         async def _do_work() -> tuple[str, bool]:
             thread_key = str(thread.id)
             session_id = await get_session_id(thread_key)
@@ -1326,10 +1335,11 @@ async def _run_one(
                 await send_response(thread, result_inner or "", images)
             return result_inner or "", is_error
 
-        if typing_ctx is not None:
-            async with typing_ctx:
+        # typing() の Forbidden 等は __aenter__ で発生する。タイピング表示無しで継続。
+        try:
+            async with thread.typing():
                 result, is_err = await _do_work()
-        else:
+        except (discord.Forbidden, discord.HTTPException):
             result, is_err = await _do_work()
         status = TAG_ERROR if is_err else TAG_COMPLETED
 
@@ -1379,16 +1389,24 @@ async def _validate_startup_targets():
         )
 
 
+_synced_once = False
+
+
 @bot.event
 async def on_ready():
+    global _synced_once
     # 起動時に hook settings を一度だけ生成（並行 run_claude の race を防ぐ）
     _ensure_hook_settings_path()
+    # start_hook_server は二重起動ガード内蔵
     await start_hook_server()
-    try:
-        synced = await bot.tree.sync()
-    except discord.HTTPException as e:
-        log.warning("スラッシュコマンド同期失敗: %s", e)
-        synced = []
+    # tree.sync() は global で 1h あたり 2 回までしか許されない。再接続で連発しないよう初回だけ
+    synced = []
+    if not _synced_once:
+        try:
+            synced = await bot.tree.sync()
+            _synced_once = True
+        except discord.HTTPException as e:
+            log.warning("スラッシュコマンド同期失敗: %s", e)
     log.info("Bot起動: %s (%d個のコマンドを同期)", bot.user, len(synced))
     log.info("フォーラムチャンネルID: %s", FORUM_CHANNEL_ID)
     log.info("ログチャンネルID: %s", LOG_CHANNEL_ID)
@@ -1436,30 +1454,39 @@ def cleanup_attachments(paths: list[Path]):
 
 def decode_project_path(encoded: str) -> str | None:
     """プロジェクトディレクトリ名からファイルシステムパスを復元する。
-    例: 'C--Users-user-discord-claude-bridge' → 'C:\\Users\\user\\discord-claude-bridge'
+    Windows: 'C--Users-user-discord-claude-bridge' → 'C:\\Users\\user\\discord-claude-bridge'
+    POSIX  : '-home-user-myproject' (元 `/home/user/myproject`) → '/home/user/myproject'
     """
-    if not encoded or "--" not in encoded:
+    if not encoded:
         return None
-    parts = encoded.split("--", 1)
-    if len(parts) != 2:
-        return None
-    drive = parts[0] + ":"
-    rest = parts[1]
-    segments = rest.split("-")
 
-    def resolve(idx: int, current: str) -> str | None:
+    def resolve(segments: list[str], idx: int, current: str) -> str | None:
         if idx >= len(segments):
             return current if os.path.isdir(current) else None
         for end in range(len(segments), idx, -1):
             segment = "-".join(segments[idx:end])
             candidate = os.path.join(current, segment)
             if os.path.isdir(candidate):
-                result = resolve(end, candidate)
+                result = resolve(segments, end, candidate)
                 if result:
                     return result
         return None
 
-    return resolve(0, drive + os.sep)
+    # Windows 形式: drive--rest
+    if "--" in encoded:
+        parts = encoded.split("--", 1)
+        if len(parts) == 2 and len(parts[0]) == 1:
+            drive = parts[0] + ":"
+            segments = parts[1].split("-")
+            return resolve(segments, 0, drive + os.sep)
+
+    # POSIX 形式: 先頭ハイフン or 単にハイフン区切り → / から復号
+    if sys.platform != "win32":
+        s = encoded.lstrip("-")
+        segments = s.split("-")
+        return resolve(segments, 0, "/")
+
+    return None
 
 
 def find_session_cwd(session_id: str) -> str | None:
