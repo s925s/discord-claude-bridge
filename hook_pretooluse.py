@@ -81,6 +81,16 @@ def perform_write(tool_name: str, tool_input: dict) -> str:
     file_path = tool_input.get("file_path") or tool_input.get("notebook_path") or ""
     if not file_path:
         raise ValueError("file_path が空です")
+    # シンボリックリンク/相対パスを実体に解決し、sensitive 判定を再確認
+    try:
+        resolved = os.path.realpath(file_path)
+    except (OSError, ValueError):
+        resolved = file_path
+    if resolved != file_path:
+        # 解決後パスが sensitive でも書き込み自体は承認済みなので続行するが、
+        # シンボリックリンク先の書き換えはユーザーに見えにくいのでログに出す
+        print(f"hook_pretooluse: file_path 解決 {file_path!r} -> {resolved!r}", file=sys.stderr)
+    file_path = resolved
 
     if tool_name == "Write":
         content = tool_input.get("content", "")
@@ -201,6 +211,10 @@ def main():
                     "session_id": session_id,
                     "sensitive": True,
                 })
+            except urllib.error.HTTPError as e:
+                # 401/5xx: bot は生きてるが認証失敗/サーバーエラー → sensitive path は安全側に倒し deny
+                emit(make_response("deny", f"ブリッジ認証/応答エラー (HTTP {e.code}): sensitive path 書き込みを拒否"))
+                sys.exit(0)
             except (urllib.error.URLError, socket.timeout, ConnectionError) as e:
                 emit(make_response("deny", f"ブリッジへの接続失敗（sensitive path 確認取れず）: {e}"))
                 sys.exit(0)
@@ -252,6 +266,10 @@ def main():
                 emit(make_response("allow"))
             else:
                 emit(make_response("deny", reason or "ユーザーが拒否しました"))
+        except urllib.error.HTTPError as e:
+            # 401/5xx: 認証失敗/サーバーエラーは deny に倒す（allow フォールバックは抜け穴になる）
+            print(f"hook_pretooluse bot HTTP error: {e.code}", file=sys.stderr)
+            emit(make_response("deny", f"ブリッジ認証/応答エラー (HTTP {e.code})"))
         except (urllib.error.URLError, socket.timeout, ConnectionError) as e:
             # bot 未起動・落ちている: 詰まないように許可で抜ける
             print(f"hook_pretooluse bot unreachable: {e}", file=sys.stderr)

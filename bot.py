@@ -61,7 +61,7 @@ def _require_int(name: str, allow_zero_for: list[str] | None = None) -> int:
         raise SystemExit(f"環境変数 {name} は整数である必要があります（現値: {raw!r}）")
 
 
-TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
+TOKEN = os.getenv("DISCORD_TOKEN", "").strip().lstrip("﻿")  # BOM 付き .env への防御
 if not TOKEN:
     raise SystemExit("環境変数 DISCORD_TOKEN が未設定です。.env を確認してください")
 
@@ -122,8 +122,26 @@ TEMP_DIR = Path(tempfile.gettempdir()) / "discord-claude-bridge"
 TEMP_DIR.mkdir(exist_ok=True)
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
 DISCORD_FILE_LIMIT = 24 * 1024 * 1024  # 25MB から少し余裕
-SOFT_TIMEOUT = int(os.getenv("SOFT_TIMEOUT", "600"))   # まだ動いてるよ通知
-HARD_TIMEOUT = int(os.getenv("HARD_TIMEOUT", "3600"))  # 強制終了
+def _validate_timeout(name: str, default: str) -> int:
+    raw = os.getenv(name, default).strip()
+    try:
+        v = int(raw)
+    except ValueError:
+        raise SystemExit(f"{name} は整数である必要があります（現値: {raw!r}）")
+    if v < 0:
+        raise SystemExit(f"{name} は 0 以上である必要があります（現値: {v}）")
+    return v
+
+
+SOFT_TIMEOUT = _validate_timeout("SOFT_TIMEOUT", "600")   # まだ動いてるよ通知 (0 で無効)
+HARD_TIMEOUT = _validate_timeout("HARD_TIMEOUT", "3600")  # 強制終了 (0 で無効化したい場合は超大値推奨)
+if HARD_TIMEOUT == 0:
+    raise SystemExit("HARD_TIMEOUT=0 は許可されていません（必ず正の値を指定してください）")
+if SOFT_TIMEOUT > 0 and SOFT_TIMEOUT >= HARD_TIMEOUT:
+    log.warning(
+        "SOFT_TIMEOUT(%d) >= HARD_TIMEOUT(%d): ソフト通知より先に強制終了するため通知は表示されません",
+        SOFT_TIMEOUT, HARD_TIMEOUT,
+    )
 STREAM_LINE_BUFSIZE = 16 * 1024 * 1024  # 1行あたり最大16MB（画像 base64 を含む長行に対応）
 
 # フォーラムタグ名
@@ -627,7 +645,11 @@ async def stop_hook_server():
         _hook_runner = None
 
 
+_HOOK_SETTINGS_PATH: str | None = None
+
+
 def build_hook_settings() -> str:
+    """フック設定 JSON を生成して書き込む。並行書き込みを避けるため atomic rename。"""
     base_dir = Path(__file__).parent.resolve()
     pretooluse_script = str(base_dir / "hook_pretooluse.py")
     permission_script = str(base_dir / "hook_permission_request.py")
@@ -658,8 +680,24 @@ def build_hook_settings() -> str:
         },
     }
     settings_path = base_dir / ".claude_hook_settings.json"
-    settings_path.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+    tmp_path = settings_path.with_suffix(".json.tmp")
+    try:
+        tmp_path.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+        os.replace(tmp_path, settings_path)
+    except OSError as e:
+        raise SystemExit(
+            f"フック設定ファイルの書き込みに失敗しました ({settings_path}): {e}\n"
+            f"ディスク容量とディレクトリの書き込み権限を確認してください"
+        )
     return str(settings_path)
+
+
+def _ensure_hook_settings_path() -> str:
+    """起動時に1回だけ生成。並行 run_claude による race を回避する。"""
+    global _HOOK_SETTINGS_PATH
+    if _HOOK_SETTINGS_PATH is None:
+        _HOOK_SETTINGS_PATH = build_hook_settings()
+    return _HOOK_SETTINGS_PATH
 
 
 # ==============================
@@ -667,6 +705,18 @@ def build_hook_settings() -> str:
 # ==============================
 
 def load_sessions() -> dict:
+    # 前回 atomic rename が完了せず .tmp が残っているケースを救済
+    tmp = SESSIONS_FILE.with_suffix(".json.tmp")
+    if tmp.exists():
+        try:
+            if not SESSIONS_FILE.exists() or tmp.stat().st_mtime > SESSIONS_FILE.stat().st_mtime:
+                log.warning("%s が残存。本体より新しいので復旧します", tmp)
+                os.replace(tmp, SESSIONS_FILE)
+            else:
+                tmp.unlink(missing_ok=True)
+        except OSError as e:
+            log.warning("sessions.json.tmp 処理失敗: %s", e)
+
     if not SESSIONS_FILE.exists():
         return {}
     try:
@@ -716,6 +766,9 @@ def _extract_images_from_blocks(blocks, images: list):
                 except (ValueError, TypeError) as e:
                     log.warning("画像デコードエラー: %s", e)
                     continue
+                if not data:
+                    log.warning("0バイト画像をスキップ")
+                    continue
                 if len(data) > DISCORD_FILE_LIMIT:
                     log.warning("画像が大きすぎ (%d bytes), スキップ", len(data))
                     continue
@@ -726,7 +779,25 @@ def _extract_images_from_blocks(blocks, images: list):
             _extract_images_from_blocks(b.get("content"), images)
 
 
-def parse_stream_events(events: list, stderr: str, session_id: str | None) -> tuple[str, str | None, list]:
+# --resume が失敗したことを示唆する stderr パターン
+_RESUME_FAIL_PATTERNS = (
+    "session not found",
+    "no such session",
+    "could not find session",
+    "session does not exist",
+    "session id not found",
+)
+
+
+def _stderr_indicates_resume_fail(stderr: str) -> bool:
+    if not stderr:
+        return False
+    s = stderr.lower()
+    return any(p in s for p in _RESUME_FAIL_PATTERNS)
+
+
+def parse_stream_events(events: list, stderr: str, session_id: str | None) -> tuple[str, str | None, list, bool]:
+    """戻り値: (output, new_session_id, images, is_error)"""
     new_session_id = session_id
     final_text = ""
     fallback_text_parts: list[str] = []
@@ -734,6 +805,7 @@ def parse_stream_events(events: list, stderr: str, session_id: str | None) -> tu
     is_error = False
     error_msg = ""
     result_subtype = ""
+    saw_result = False
 
     for ev in events:
         if not isinstance(ev, dict):
@@ -765,6 +837,7 @@ def parse_stream_events(events: list, stderr: str, session_id: str | None) -> tu
             _extract_images_from_blocks(content, images)
 
         elif etype == "result":
+            saw_result = True
             new_session_id = ev.get("session_id") or new_session_id
             is_error = bool(ev.get("is_error"))
             result_subtype = ev.get("subtype", "") or ""
@@ -781,16 +854,23 @@ def parse_stream_events(events: list, stderr: str, session_id: str | None) -> tu
         if not error_msg:
             error_msg = f"Claude Code: {result_subtype}"
 
+    # result イベントすら来なかった = subprocess が起動失敗 or auth エラー等
+    if not saw_result and stderr:
+        is_error = True
+
     output = final_text or "\n".join(p for p in fallback_text_parts if p).strip()
     if is_error and not output:
         output = f"エラー: {error_msg or stderr or '不明なエラー'}"
+    elif is_error and stderr:
+        # 正常 output がある場合でも stderr を補足で添える (1500→2500字)
+        output = f"{output}\n\n---\nstderr (抜粋): {stderr.strip()[:1500]}"
     if not output and stderr:
-        # auth エラー等を可視化
-        output = f"エラー: {stderr.strip()[:1500]}"
+        # auth エラー等を可視化（2500字まで）
+        output = f"エラー: {stderr.strip()[:2500]}"
     if not output and not images:
         output = "（Claude Codeからの応答が空でした。再度試してください）"
 
-    return output.strip(), new_session_id, images
+    return output.strip(), new_session_id, images, is_error
 
 
 def _drain_stderr(stream, sink: list):
@@ -911,12 +991,15 @@ def _build_claude_args(prompt: str, session_id: str | None, settings_path: str) 
 
     args.extend(["--settings", settings_path])
 
-    if MAX_TURNS:
+    # MAX_TURNS は "0" が「無制限」を意図する誤設定なので除外。1以上のみ渡す。
+    if MAX_TURNS and MAX_TURNS != "0":
         args.extend(["--max-turns", MAX_TURNS])
-    if MAX_BUDGET_USD:
+    if MAX_BUDGET_USD and MAX_BUDGET_USD not in ("0", "0.0"):
         args.extend(["--max-budget-usd", MAX_BUDGET_USD])
     if session_id:
         args.extend(["--resume", session_id])
+    # prompt が `--` で始まる場合に CLI パーサが引数と誤認しないよう区切る
+    args.append("--")
     args.append(prompt)
     return args
 
@@ -927,8 +1010,10 @@ async def run_claude(
     thread: discord.Thread | None = None,
     thread_title: str | None = None,
     cwd: str | None = None,
-) -> tuple[str | None, str | None, list]:
-    settings_path = build_hook_settings()
+) -> tuple[str | None, str | None, list, bool]:
+    """戻り値: (response_text_or_None, new_session_id, images, is_error)
+    response_text が None のときは placeholder で送信済み。"""
+    settings_path = _ensure_hook_settings_path()
 
     if not session_id and thread_title:
         prompt = f"[スレッドタイトル: {thread_title}]\n\n{prompt}"
@@ -945,7 +1030,7 @@ async def run_claude(
 
     placeholder = None
     notify_task = None
-    if thread:
+    if thread and SOFT_TIMEOUT > 0:
         async def _soft_timeout_notify():
             nonlocal placeholder
             await asyncio.sleep(SOFT_TIMEOUT)
@@ -963,13 +1048,22 @@ async def run_claude(
         msg = f"タイムアウトしました（{HARD_TIMEOUT // 60}分超過、強制終了）"
         if placeholder:
             await safe_edit(placeholder, msg)
-        return msg, session_id, []
+            return None, session_id, [], True
+        return msg, session_id, [], True
 
-    output, new_session_id, images = parse_stream_events(events, stderr, session_id)
+    output, new_session_id, images, is_error = parse_stream_events(events, stderr, session_id)
+
+    # --resume が「セッション無し」で失敗した場合は new_session_id を None にして呼び出し側で破棄させる
+    if session_id and is_error and _stderr_indicates_resume_fail(stderr):
+        log.warning("--resume 失敗を検知。session_id を破棄: %s", session_id)
+        new_session_id = None
 
     if placeholder:
         chunks = split_message(output, 2000)
-        await safe_edit(placeholder, chunks[0])
+        edited = await safe_edit(placeholder, chunks[0])
+        if edited is None:
+            # placeholder が削除済 等 → chunks[0] も新規送信
+            await safe_send(thread, chunks[0])
         for chunk in chunks[1:]:
             await safe_send(thread, chunk)
         for img_data, filename in images:
@@ -977,9 +1071,9 @@ async def run_claude(
                 await safe_send(thread, file=discord.File(io.BytesIO(img_data), filename=filename))
             except (OSError, ValueError) as e:
                 log.warning("画像送信準備エラー: %s", e)
-        return None, new_session_id, []
+        return None, new_session_id, [], is_error
 
-    return output, new_session_id, images
+    return output, new_session_id, images, is_error
 
 
 # ==============================
@@ -990,6 +1084,13 @@ async def get_or_create_tag(forum: discord.ForumChannel, name: str) -> discord.F
     for tag in forum.available_tags:
         if tag.name == name:
             return tag
+    if len(forum.available_tags) >= 20:
+        log.error(
+            "フォーラムタグが 20 個上限に達しているため `%s` を作成できません。"
+            "不要なタグを Discord 側で削除してください",
+            name,
+        )
+        return None
     new_tags = list(forum.available_tags) + [discord.ForumTag(name=name)]
     try:
         await forum.edit(available_tags=new_tags)
@@ -1081,6 +1182,9 @@ async def send_response(channel: discord.Thread, text: str, images: list[tuple[b
                 log.warning("画像送信準備エラー: %s", e)
 
 
+_CODE_FENCE_OPEN_RE = re.compile(r"```([A-Za-z0-9_+\-]*)", re.MULTILINE)
+
+
 def split_message(text: str, limit: int = 2000) -> list[str]:
     if len(text) <= limit:
         return [text]
@@ -1096,8 +1200,11 @@ def split_message(text: str, limit: int = 2000) -> list[str]:
         chunk = text[:cut]
         text = text[cut:].lstrip("\n")
         if chunk.count("```") % 2 == 1:
+            # コードブロックを跨いだ。最後の開きフェンスの言語タグを次チャンクに引き継ぐ
+            fences = _CODE_FENCE_OPEN_RE.findall(chunk)
+            lang = fences[-1] if fences and len(fences) % 2 == 1 else ""
             chunk += "\n```"
-            text = "```\n" + text
+            text = f"```{lang}\n" + text
         chunks.append(chunk)
 
     return chunks
@@ -1193,7 +1300,7 @@ async def _run_one(
         except discord.Forbidden:
             typing_ctx = None
 
-        async def _do_work():
+        async def _do_work() -> tuple[str, bool]:
             thread_key = str(thread.id)
             session_id = await get_session_id(thread_key)
             # session_id が不正形式または .jsonl が存在しなければ resume を諦めて新規開始
@@ -1201,23 +1308,30 @@ async def _run_one(
                 log.warning("不正形式の session_id を破棄: %s", session_id)
                 session_id = None
             run_cwd = cwd or (find_session_cwd(session_id) if session_id else None) or str(Path.home())
-            result_inner, new_session_id, images = await run_claude(
+            result_inner, new_session_id, images, is_error = await run_claude(
                 prompt, session_id, thread, thread.name, cwd=run_cwd,
             )
-            if new_session_id:
+            # --resume 失敗時は session を破棄して次回新規開始
+            if session_id and new_session_id is None and is_error:
+                async with sessions_lock:
+                    sessions = load_sessions()
+                    if sessions.pop(thread_key, None) is not None:
+                        save_sessions(sessions)
+                log.info("壊れた session_id を sessions.json から削除: %s", session_id)
+            elif new_session_id and new_session_id != session_id:
                 await set_session_id(thread_key, new_session_id)
                 if not session_id:
                     await safe_send(thread, f"🆔 Session: `{new_session_id}`")
             if result_inner is not None or images:
                 await send_response(thread, result_inner or "", images)
-            return result_inner
+            return result_inner or "", is_error
 
         if typing_ctx is not None:
             async with typing_ctx:
-                result = await _do_work() or ""
+                result, is_err = await _do_work()
         else:
-            result = await _do_work() or ""
-        status = TAG_COMPLETED
+            result, is_err = await _do_work()
+        status = TAG_ERROR if is_err else TAG_COMPLETED
 
     except Exception as e:
         log.exception("_run_one エラー")
@@ -1267,6 +1381,8 @@ async def _validate_startup_targets():
 
 @bot.event
 async def on_ready():
+    # 起動時に hook settings を一度だけ生成（並行 run_claude の race を防ぐ）
+    _ensure_hook_settings_path()
     await start_hook_server()
     try:
         synced = await bot.tree.sync()
@@ -1287,13 +1403,14 @@ async def on_ready():
 
 async def download_attachments(message: discord.Message) -> list[Path]:
     downloaded = []
-    for att in message.attachments:
+    for i, att in enumerate(message.attachments):
         # API直叩きで `../` 等が来てもパストラバーサルを許さない
         safe_name = Path(att.filename).name
         ext = Path(safe_name).suffix.lower()
         if ext not in IMAGE_EXTENSIONS:
             continue
-        save_path = TEMP_DIR / f"{message.id}_{safe_name}"
+        # 同名添付ファイル衝突回避のため index 付与
+        save_path = TEMP_DIR / f"{message.id}_{i}_{safe_name}"
         # 念のため save_path が TEMP_DIR 配下に収まっているか再検証
         try:
             save_path.resolve().relative_to(TEMP_DIR.resolve())

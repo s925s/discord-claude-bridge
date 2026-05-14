@@ -88,7 +88,21 @@ def main():
         try:
             with urllib.request.urlopen(req, timeout=600) as resp:
                 result = json.loads(resp.read().decode("utf-8", errors="replace"))
-            emit(result)
+            # bot から返ってきたレスポンスを PermissionRequest 形式に正規化
+            hso = result.get("hookSpecificOutput", {}) if isinstance(result, dict) else {}
+            if "decision" in hso:
+                emit(result)
+            elif "permissionDecision" in hso:
+                # PreToolUse 形式 → PermissionRequest 形式に変換
+                dec = hso.get("permissionDecision", "deny")
+                reason = hso.get("permissionDecisionReason", "")
+                emit(make_response(dec, reason))
+            else:
+                emit(make_response("allow"))
+        except urllib.error.HTTPError as e:
+            print(f"hook_permission_request bot HTTP error: {e.code}", file=sys.stderr)
+            # 認証/サーバーエラーは deny に倒して安全側に
+            emit(make_response("deny", f"ブリッジ認証/応答エラー (HTTP {e.code})"))
         except (urllib.error.URLError, socket.timeout, ConnectionError) as e:
             print(f"hook_permission_request bot unreachable: {e}", file=sys.stderr)
             emit(make_response("allow"))
