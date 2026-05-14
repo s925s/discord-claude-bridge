@@ -118,20 +118,49 @@ python bot.py
 
 > 主题帖标题会自动作为新会话的上下文附加。
 
-### 斜杠命令
+### 斜杠命令 (`/bridge-*` 前缀以避免与 Claude Code 冲突)
 
 | 命令 | 说明 |
 |---|---|
-| `/help` | 显示可用命令列表 |
-| `/sessions [数量]` | 显示PC上的Claude Code会话列表（默认10个，最多20个） |
-| `/resume <session_id> [title] [prompt]` | 将指定会话继承到Discord |
-| `/resume-latest [title] [prompt]` | 一键继承最新会话 |
+| `/bridge-help` | 显示命令列表 |
+| `/bridge-sessions [数量]` | PC Claude Code 会话列表（最多20） |
+| `/bridge-resume <session_id> [title] [prompt]` | 将指定会话继承到Discord |
+| `/bridge-resume-latest [title] [prompt]` | 一键继承最新会话 |
+
+#### 主题帖内命令 (在 bridge 论坛主题帖中执行)
+
+| 命令 | 说明 |
+|---|---|
+| `/bridge-info` | 显示主题帖的会话ID / cwd / 允许工具 / 使用量 |
+| `/bridge-forget` | 丢弃本主题帖的会话，下条消息开始新会话 |
+| `/bridge-cancel` | 杀掉本主题帖运行中的 claude |
+| `/bridge-retry` | 重新执行上一条消息 |
+| `/bridge-cwd [path]` | 固定工作目录（空清除） |
+| `/bridge-reset-perms` | 清除「始终允许」的工具列表 |
+| `/bridge-usage` | 累计 token / 美元费用 |
+| `/bridge-archive` | 归档本主题帖 |
+
+> Claude Code 自身的斜杠命令 (`/init` `/clear` `/compact` `/model` `/cost` `/help` 等) 直接作为消息文本发送即可。
 
 ### 前缀命令
 
 | 命令 | 说明 |
 |---|---|
 | `!sync` | 将斜杠命令同步到Discord（添加/修改命令后执行一次） |
+
+### 实时进度
+
+Claude 调用工具时，进度消息会逐行更新 (TUI 风格):
+
+```
+🔧 进度
+📖 Read `~/project/src/main.py`
+🔎 Grep `pattern` in `src/`
+⚡ Bash `npm test`
+✏️ Edit `~/project/src/main.py`
+```
+
+编辑被限制为最多每 1.5 秒一次，以避免 Discord 速率限制。
 
 ## 权限模式
 

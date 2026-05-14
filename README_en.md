@@ -118,20 +118,49 @@ python bot.py
 
 > Thread titles are automatically included as context for new sessions.
 
-### Slash Commands
+### Slash Commands (`/bridge-*` prefix to avoid collision with Claude Code)
 
 | Command | Description |
 |---|---|
-| `/help` | Show available commands |
-| `/sessions [count]` | List PC's Claude Code sessions (default 10, max 20) |
-| `/resume <session_id> [title] [prompt]` | Resume a specific session in Discord |
-| `/resume-latest [title] [prompt]` | Resume the latest session with one click |
+| `/bridge-help` | Show commands |
+| `/bridge-sessions [count]` | List PC Claude Code sessions (max 20) |
+| `/bridge-resume <session_id> [title] [prompt]` | Resume a session in Discord |
+| `/bridge-resume-latest [title] [prompt]` | Resume the latest session with one click |
+
+#### Per-thread commands (run inside a bridge forum thread)
+
+| Command | Description |
+|---|---|
+| `/bridge-info` | Show thread's session ID / cwd / allowed tools / usage |
+| `/bridge-forget` | Discard the thread's session; next message starts fresh |
+| `/bridge-cancel` | Kill the running claude in this thread |
+| `/bridge-retry` | Re-run the last message |
+| `/bridge-cwd [path]` | Pin working directory (empty to clear) |
+| `/bridge-reset-perms` | Clear "always allow" tools for this thread |
+| `/bridge-usage` | Show cumulative tokens / USD cost |
+| `/bridge-archive` | Archive this thread |
+
+> Claude Code's own slash commands (`/init` `/clear` `/compact` `/model` `/cost` `/help` etc.) work by sending them as plain message text inside a thread.
 
 ### Prefix Commands
 
 | Command | Description |
 |---|---|
 | `!sync` | Sync slash commands to Discord (run once after adding/changing commands) |
+
+### Live progress
+
+A progress message updates line-by-line as Claude calls tools (TUI-style):
+
+```
+🔧 Progress
+📖 Read `~/project/src/main.py`
+🔎 Grep `pattern` in `src/`
+⚡ Bash `npm test`
+✏️ Edit `~/project/src/main.py`
+```
+
+Edits are rate-limited to once every 1.5 seconds to stay under Discord's limits.
 
 ## Permission Mode
 

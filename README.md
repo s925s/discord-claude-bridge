@@ -117,20 +117,49 @@ python bot.py
 
 > スレッドタイトルは新規セッション時のコンテキストとして自動的に付加されます。
 
-### スラッシュコマンド
+### スラッシュコマンド (`/bridge-*` プレフィックスで Claude Code と衝突回避)
 
 | コマンド | 説明 |
 |---|---|
-| `/help` | コマンド一覧を表示 |
-| `/sessions [件数]` | PCのClaude Codeセッション一覧を表示（デフォルト10件、最大20件） |
-| `/resume <session_id> [title] [prompt]` | 指定セッションをDiscordに引き継ぎ |
-| `/resume-latest [title] [prompt]` | 最新セッションをワンクリックで引き継ぎ |
+| `/bridge-help` | コマンド一覧を表示 |
+| `/bridge-sessions [件数]` | PCのClaude Codeセッション一覧を表示（最大20件） |
+| `/bridge-resume <session_id> [title] [prompt]` | 指定セッションをDiscordに引き継ぎ |
+| `/bridge-resume-latest [title] [prompt]` | 最新セッションをワンクリックで引き継ぎ |
+
+#### スレッド内コマンド (フォーラムスレッド内で実行)
+
+| コマンド | 説明 |
+|---|---|
+| `/bridge-info` | スレッドのセッションID・cwd・許可ツール・累積使用量 |
+| `/bridge-forget` | このスレッドのセッションを破棄して次から新規開始 |
+| `/bridge-cancel` | 走行中の claude を kill |
+| `/bridge-retry` | 直前のメッセージを再実行 |
+| `/bridge-cwd [path]` | 作業ディレクトリを固定（空文字で解除） |
+| `/bridge-reset-perms` | 「常に許可」したツールを全クリア |
+| `/bridge-usage` | 累積トークン・USDコスト表示 |
+| `/bridge-archive` | スレッドをアーカイブ |
+
+> Claude Code 自身のスラッシュコマンド (`/init` `/clear` `/compact` `/model` `/cost` `/help` 等) はスレッド本文に普通に書けばそのまま動きます。
 
 ### プレフィックスコマンド
 
 | コマンド | 説明 |
 |---|---|
 | `!sync` | スラッシュコマンドをDiscordに同期（コマンド追加・変更後に1回実行） |
+
+### 途中経過表示
+
+Claude がツールを使うたび、進捗メッセージが 1 行ずつ更新されます (TUI 風):
+
+```
+🔧 進捗
+📖 Read `~/project/src/main.py`
+🔎 Grep `pattern` in `src/`
+⚡ Bash `npm test`
+✏️ Edit `~/project/src/main.py`
+```
+
+Discord rate limit 対策として最大 1.5 秒に 1 回の編集に制限されます。
 
 ## 権限モード
 

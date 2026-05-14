@@ -152,11 +152,27 @@ TAG_ERROR = "エラー"
 # 走行中の Claude subprocess を追跡（bot 終了時に確実に kill するため）
 _active_procs: "weakref.WeakSet[subprocess.Popen]" = weakref.WeakSet()
 _active_procs_lock = threading.Lock()
+# スレッドID → 現在実行中の subprocess。/cancel から取り出して kill する
+_thread_procs: dict[int, subprocess.Popen] = {}
 
 
-def _register_proc(proc: subprocess.Popen):
+def _register_proc(proc: subprocess.Popen, thread_id: int | None = None):
     with _active_procs_lock:
         _active_procs.add(proc)
+        if thread_id is not None:
+            _thread_procs[thread_id] = proc
+
+
+def _unregister_thread_proc(thread_id: int | None):
+    if thread_id is None:
+        return
+    with _active_procs_lock:
+        _thread_procs.pop(thread_id, None)
+
+
+def get_thread_proc(thread_id: int) -> subprocess.Popen | None:
+    with _active_procs_lock:
+        return _thread_procs.get(thread_id)
 
 
 def _kill_all_procs():
@@ -171,6 +187,13 @@ def _kill_all_procs():
 
 
 atexit.register(_kill_all_procs)
+
+# /cwd で固定された thread → cwd
+thread_cwds: dict[int, str] = {}
+# /usage 用の累積使用量 (thread → {"input_tokens": N, "output_tokens": N, "cost_usd": float, "turns": N})
+usage_stats: dict[int, dict] = {}
+# /retry 用の直前 prompt (thread → prompt 本文)
+last_prompts: dict[int, str] = {}
 
 
 # ==============================
@@ -897,7 +920,14 @@ def _drain_stderr(stream, sink: list):
             pass
 
 
-def _run_claude_subprocess(args: list, env: dict, cwd: str | None):
+def _run_claude_subprocess(
+    args: list,
+    env: dict,
+    cwd: str | None,
+    thread_id: int | None = None,
+    event_queue: "asyncio.Queue | None" = None,
+    main_loop: "asyncio.AbstractEventLoop | None" = None,
+):
     try:
         proc = subprocess.Popen(
             args,
@@ -916,7 +946,7 @@ def _run_claude_subprocess(args: list, env: dict, cwd: str | None):
     except OSError as e:
         return [], f"claude 起動失敗: {e}", False
 
-    _register_proc(proc)
+    _register_proc(proc, thread_id)
     timed_out_flag = [False]
 
     def _kill_on_timeout():
@@ -935,6 +965,15 @@ def _run_claude_subprocess(args: list, env: dict, cwd: str | None):
     )
     stderr_thread.start()
 
+    def _push_event(ev):
+        if event_queue is None or main_loop is None:
+            return
+        try:
+            main_loop.call_soon_threadsafe(event_queue.put_nowait, ev)
+        except RuntimeError:
+            # loop closed
+            pass
+
     events: list = []
     try:
         # readline は LINE_BUFSIZE まで読む。画像 base64 を含む長行に対応
@@ -943,19 +982,18 @@ def _run_claude_subprocess(args: list, env: dict, cwd: str | None):
             if not line:
                 continue
             try:
-                events.append(json.loads(line.decode("utf-8", errors="replace")))
+                ev = json.loads(line.decode("utf-8", errors="replace"))
             except json.JSONDecodeError:
                 continue
+            events.append(ev)
+            _push_event(ev)
     except (OSError, ValueError) as e:
         log.warning("stream-json 読み取りエラー: %s", e)
     finally:
         # cancel() の戻り値: True=キャンセル成功, False=既にfired
-        # fired 後の自己cancel と本物の timeout を区別する
         if not timer.cancel():
-            # 既に _kill_on_timeout に入っているか実行済み
             pass
         else:
-            # キャンセル成功 = タイマー fired していない = 正常終了
             timed_out_flag[0] = False
         try:
             proc.stdout.close()
@@ -969,12 +1007,11 @@ def _run_claude_subprocess(args: list, env: dict, cwd: str | None):
             proc.kill()
         except Exception:
             pass
-        # 2回目の wait は OS が回収するまでバックグラウンドで待つ
         threading.Thread(target=lambda: _safe_wait(proc), daemon=True).start()
 
-    # subprocess が完全に終わってれば stderr は EOF なのでブロックしない
     stderr_thread.join(timeout=10)
     stderr = b"".join(stderr_chunks).decode("utf-8", errors="replace")
+    _unregister_thread_proc(thread_id)
 
     return events, stderr, timed_out_flag[0]
 
@@ -1012,6 +1049,148 @@ def _build_claude_args(prompt: str, session_id: str | None, settings_path: str) 
     return args
 
 
+# ツール名 → 進捗表示用絵文字
+_TOOL_EMOJI = {
+    "Read": "📖", "Glob": "🔍", "Grep": "🔎",
+    "Bash": "⚡", "BashOutput": "📤", "KillShell": "🛑",
+    "Write": "📝", "Edit": "✏️", "MultiEdit": "✏️", "NotebookEdit": "📓",
+    "WebFetch": "🌐", "WebSearch": "🌐",
+    "Task": "🤖", "Agent": "🤖",
+    "TaskCreate": "📋", "TaskUpdate": "📋", "TaskList": "📋", "TaskGet": "📋",
+    "TaskOutput": "📋", "TaskStop": "📋",
+    "Skill": "🛠️", "ToolSearch": "🔧", "Monitor": "👀",
+    "AskUserQuestion": "❓", "TodoWrite": "✅",
+    "EnterPlanMode": "🗺️", "ExitPlanMode": "🗺️",
+    "EnterWorktree": "🌿", "ExitWorktree": "🌿",
+    "ScheduleWakeup": "⏰",
+}
+
+
+def _format_tool_use_line(name: str, inp: dict) -> str:
+    emoji = _TOOL_EMOJI.get(name, "🔧")
+    if not isinstance(inp, dict):
+        return f"{emoji} `{name}`"
+    if name == "Bash":
+        cmd = (inp.get("command") or "").replace("\n", " ")
+        return f"{emoji} `{name}` `{cmd[:100]}`"
+    if name in ("Read", "Edit", "Write", "MultiEdit", "NotebookEdit"):
+        path = inp.get("file_path") or inp.get("notebook_path") or ""
+        # ホーム配下を ~ に省略
+        try:
+            h = str(Path.home())
+            if path.startswith(h):
+                path = "~" + path[len(h):]
+        except Exception:
+            pass
+        return f"{emoji} `{name}` `{path[:100]}`"
+    if name == "Glob":
+        return f"{emoji} `{name}` `{(inp.get('pattern') or '')[:100]}`"
+    if name == "Grep":
+        pat = (inp.get("pattern") or "")[:60]
+        path = inp.get("path") or inp.get("glob") or ""
+        return f"{emoji} `{name}` `{pat}`" + (f" in `{path}`" if path else "")
+    if name in ("WebFetch",):
+        return f"{emoji} `{name}` `{(inp.get('url') or '')[:100]}`"
+    if name in ("WebSearch",):
+        return f"{emoji} `{name}` `{(inp.get('query') or '')[:100]}`"
+    if name in ("Task", "Agent"):
+        desc = inp.get("description") or inp.get("prompt") or ""
+        return f"{emoji} `{name}` {desc[:100]}"
+    if name == "TaskCreate":
+        return f"{emoji} `{name}` {(inp.get('subject') or inp.get('description') or '')[:100]}"
+    if name == "Skill":
+        return f"{emoji} `{name}` `{(inp.get('skill') or '')[:60]}`"
+    if name == "AskUserQuestion":
+        qs = inp.get("questions") or []
+        if isinstance(qs, list) and qs:
+            return f"{emoji} `{name}` {str(qs[0].get('question', ''))[:100]}"
+        return f"{emoji} `{name}`"
+    return f"{emoji} `{name}`"
+
+
+def _format_event_for_progress(ev: dict) -> str | None:
+    """stream-json イベントから進捗 1 行を生成。None は表示しない。"""
+    etype = ev.get("type")
+    if etype == "assistant":
+        msg = ev.get("message") or {}
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if isinstance(content, list):
+            for b in content:
+                if isinstance(b, dict) and b.get("type") == "tool_use":
+                    return _format_tool_use_line(b.get("name", ""), b.get("input") or {})
+    elif etype == "system" and ev.get("subtype") == "compact_boundary":
+        return "🗜️ `compact` (会話圧縮)"
+    return None
+
+
+async def _progress_consumer(thread, event_queue: asyncio.Queue, header: str = "🔧 **進捗**"):
+    """イベントキューから進捗を消費してメッセージ編集"""
+    progress_msg = None
+    lines: list[str] = []
+    last_edit = 0.0
+    MIN_INTERVAL = 1.5  # Discord rate-limit 対策
+
+    async def _flush(final: bool = False):
+        nonlocal progress_msg
+        if not lines:
+            return
+        body = header + "\n" + "\n".join(lines[-20:])
+        if len(body) > 1900:
+            body = body[:1900] + "…"
+        if progress_msg is None:
+            progress_msg = await safe_send(thread, body)
+        else:
+            edited = await safe_edit(progress_msg, body)
+            if edited is None and final:
+                # 編集失敗 (削除等) → 新規送信
+                progress_msg = await safe_send(thread, body)
+
+    try:
+        while True:
+            ev = await event_queue.get()
+            if ev is None:
+                break
+            line = _format_event_for_progress(ev)
+            if not line:
+                continue
+            lines.append(line)
+            now = asyncio.get_event_loop().time()
+            if now - last_edit >= MIN_INTERVAL:
+                last_edit = now
+                await _flush()
+        await _flush(final=True)
+    except asyncio.CancelledError:
+        await _flush(final=True)
+        raise
+    return progress_msg
+
+
+def _accumulate_usage(thread_id: int, events: list):
+    """result イベントから usage 情報を抽出して累積"""
+    stats = usage_stats.setdefault(thread_id, {
+        "input_tokens": 0, "output_tokens": 0,
+        "cache_creation_tokens": 0, "cache_read_tokens": 0,
+        "cost_usd": 0.0, "turns": 0,
+    })
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        if ev.get("type") != "result":
+            continue
+        stats["turns"] += 1
+        usage = ev.get("usage") or {}
+        if isinstance(usage, dict):
+            stats["input_tokens"] += int(usage.get("input_tokens", 0) or 0)
+            stats["output_tokens"] += int(usage.get("output_tokens", 0) or 0)
+            stats["cache_creation_tokens"] += int(usage.get("cache_creation_input_tokens", 0) or 0)
+            stats["cache_read_tokens"] += int(usage.get("cache_read_input_tokens", 0) or 0)
+        cost = ev.get("total_cost_usd") or ev.get("cost_usd") or 0
+        try:
+            stats["cost_usd"] += float(cost)
+        except (TypeError, ValueError):
+            pass
+
+
 async def run_claude(
     prompt: str,
     session_id: str | None = None,
@@ -1047,7 +1226,34 @@ async def run_claude(
             )
         notify_task = asyncio.create_task(_soft_timeout_notify())
 
-    events, stderr, timed_out = await asyncio.to_thread(_run_claude_subprocess, args, env, cwd)
+    # ツール使用ストリーミング
+    event_queue: asyncio.Queue | None = None
+    main_loop: asyncio.AbstractEventLoop | None = None
+    progress_task: asyncio.Task | None = None
+    if thread:
+        event_queue = asyncio.Queue()
+        main_loop = asyncio.get_running_loop()
+        progress_task = asyncio.create_task(_progress_consumer(thread, event_queue))
+
+    thread_id = thread.id if thread else None
+    events, stderr, timed_out = await asyncio.to_thread(
+        _run_claude_subprocess, args, env, cwd, thread_id, event_queue, main_loop,
+    )
+
+    # 進捗ストリーマー停止
+    if event_queue is not None:
+        await event_queue.put(None)
+    if progress_task is not None:
+        try:
+            await asyncio.wait_for(progress_task, timeout=10)
+        except asyncio.TimeoutError:
+            progress_task.cancel()
+        except asyncio.CancelledError:
+            pass
+
+    # usage 累積（thread コンテキストありのみ）
+    if thread_id is not None:
+        _accumulate_usage(thread_id, events)
 
     if notify_task and not notify_task.done():
         notify_task.cancel()
@@ -1255,15 +1461,23 @@ async def set_session_id(thread_key: str, session_id: str):
 
 async def enqueue_for_thread(
     thread: discord.Thread,
-    message: discord.Message,
+    author: "discord.Message | discord.Interaction | str",
     prompt: str,
     cwd: str | None = None,
     image_paths: list[Path] | None = None,
 ):
+    # author: Message / Interaction / str いずれも許可
+    if isinstance(author, discord.Message):
+        author_name = str(author.author)
+    elif isinstance(author, discord.Interaction):
+        author_name = str(author.user)
+    else:
+        author_name = str(author)
     tid = thread.id
+    last_prompts[tid] = prompt
     async with _worker_lock:
         q = thread_queues.setdefault(tid, asyncio.Queue())
-        q.put_nowait((thread, message, prompt, cwd, image_paths or []))
+        q.put_nowait((thread, author_name, prompt, cwd, image_paths or []))
         worker = thread_workers.get(tid)
         if worker is None or worker.done():
             thread_workers[tid] = asyncio.create_task(process_thread(tid))
@@ -1274,12 +1488,12 @@ async def process_thread(tid: int):
     while True:
         while True:
             try:
-                thread, message, prompt, cwd, image_paths = q.get_nowait()
+                thread, author_name, prompt, cwd, image_paths = q.get_nowait()
             except asyncio.QueueEmpty:
                 break
             async with concurrency_sem:
                 try:
-                    await _run_one(thread, message, prompt, cwd, image_paths)
+                    await _run_one(thread, author_name, prompt, cwd, image_paths)
                 except Exception:
                     log.exception("ワーカー実行中に想定外エラー")
                 finally:
@@ -1295,7 +1509,7 @@ async def process_thread(tid: int):
 
 async def _run_one(
     thread: discord.Thread,
-    message: discord.Message,
+    author_name: str,
     prompt: str,
     cwd: str | None,
     image_paths: list[Path] | None = None,
@@ -1305,7 +1519,7 @@ async def _run_one(
     try:
         await set_thread_tag(thread, TAG_RUNNING)
         await send_log(
-            thread.guild, str(message.author),
+            thread.guild, author_name,
             thread.name, prompt, "", TAG_RUNNING,
         )
 
@@ -1316,7 +1530,9 @@ async def _run_one(
             if session_id and not is_valid_session_id(session_id):
                 log.warning("不正形式の session_id を破棄: %s", session_id)
                 session_id = None
-            run_cwd = cwd or (find_session_cwd(session_id) if session_id else None) or str(Path.home())
+            # /bridge-cwd で固定された cwd を最優先
+            fixed_cwd = thread_cwds.get(thread.id)
+            run_cwd = fixed_cwd or cwd or (find_session_cwd(session_id) if session_id else None) or str(Path.home())
             result_inner, new_session_id, images, is_error = await run_claude(
                 prompt, session_id, thread, thread.name, cwd=run_cwd,
             )
@@ -1353,7 +1569,7 @@ async def _run_one(
             cleanup_attachments(image_paths)
         await set_thread_tag(thread, status)
         await send_log(
-            thread.guild, str(message.author),
+            thread.guild, author_name,
             thread.name, prompt, result, status,
         )
 
@@ -1608,7 +1824,7 @@ def get_recent_sessions(limit: int = 10, exclude_discord: bool = False) -> list[
     return results[:limit]
 
 
-@bot.tree.command(name="sessions", description="PCのClaude Codeセッション一覧を表示する（最新10件）")
+@bot.tree.command(name="bridge-sessions", description="PCのClaude Codeセッション一覧を表示する（最新10件）")
 @discord.app_commands.describe(件数="表示するセッション数（デフォルト10、最大20）")
 async def list_sessions(interaction: discord.Interaction, 件数: int = 10):
     if str(interaction.user.id) not in ALLOWED_USERS:
@@ -1659,7 +1875,7 @@ async def _create_forum_thread(
     return thread_with_message.thread, thread_with_message.message
 
 
-@bot.tree.command(name="resume-latest", description="PCの最新セッションを引き継いでフォーラムスレッドを作成する")
+@bot.tree.command(name="bridge-resume-latest", description="PCの最新セッションを引き継いでフォーラムスレッドを作成する")
 @discord.app_commands.describe(
     title="スレッドのタイトル（省略時は自動生成）",
     prompt="最初に送るメッセージ（省略時はセッション要約をリクエスト）",
@@ -1698,28 +1914,217 @@ async def resume_latest(interaction: discord.Interaction, title: str = "", promp
     await enqueue_for_thread(thread, message, initial_prompt)
 
 
-@bot.tree.command(name="help", description="使えるコマンド一覧を表示する")
+@bot.tree.command(name="bridge-help", description="bridge-* コマンド一覧を表示する")
 async def show_help(interaction: discord.Interaction):
     embed = discord.Embed(title="Discord Claude Bridge - コマンド一覧", color=discord.Color.blue())
-    embed.add_field(name="/help", value="このヘルプを表示する", inline=False)
-    embed.add_field(name="/sessions [件数]", value="PCのClaude Codeセッション一覧（最大20件）", inline=False)
     embed.add_field(
-        name="/resume <session_id> [title] [prompt]",
-        value="セッションIDを指定してフォーラムスレッドを作成し、PCのセッションを引き継ぐ",
+        name="📚 セッション操作",
+        value=(
+            "`/bridge-help` — このヘルプ\n"
+            "`/bridge-sessions [件数]` — PC側 Claude Code セッション一覧（最大20）\n"
+            "`/bridge-resume <id> [title] [prompt]` — 指定セッションをDiscordへ引継ぎ\n"
+            "`/bridge-resume-latest [title] [prompt]` — 最新セッションをワンクリック引継ぎ"
+        ),
         inline=False,
     )
-    embed.add_field(name="/resume-latest [title] [prompt]", value="PCの最新セッションをワンクリックで引き継ぐ", inline=False)
     embed.add_field(
-        name="フォーラムに投稿",
-        value="フォーラムにスレッドを立てるか、既存スレッドにメッセージを送ると、Claude Codeが応答します",
+        name="🧵 スレッド単位の操作 (スレッド内で実行)",
+        value=(
+            "`/bridge-info` — このスレッドのセッションID・cwd・許可ツール表示\n"
+            "`/bridge-forget` — このスレッドのセッションを破棄して次から新規開始\n"
+            "`/bridge-cancel` — 走行中の claude を kill\n"
+            "`/bridge-retry` — 直前のメッセージを再実行\n"
+            "`/bridge-cwd [path]` — このスレッドの作業ディレクトリを固定/解除\n"
+            "`/bridge-reset-perms` — このスレッドで「常に許可」したツールを全クリア\n"
+            "`/bridge-usage` — このスレッドの累積トークン/コスト\n"
+            "`/bridge-archive` — このスレッドをアーカイブ"
+        ),
         inline=False,
     )
-    embed.add_field(name="!sync", value="スラッシュコマンドをDiscordに同期する（コマンド追加・変更時に1回）", inline=False)
-    embed.set_footer(text="画像添付にも対応しています")
+    embed.add_field(
+        name="💬 フォーラムに投稿",
+        value=(
+            "フォーラムにスレッドを立てるか、既存スレッドにメッセージを送ると Claude Code が応答します。\n"
+            "`/init` `/clear` `/compact` 等の Claude Code スラッシュコマンドはメッセージ本文として送ればそのまま動きます。"
+        ),
+        inline=False,
+    )
+    embed.add_field(name="🔄 同期", value="`!sync` — スラッシュコマンドを Discord に同期（コマンド変更時に1回）", inline=False)
+    embed.set_footer(text="画像添付にも対応。途中経過のツール使用も表示されます")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@bot.tree.command(name="resume", description="セッションIDを指定してPCのClaude Codeセッションを引き継ぐ")
+# =========================================================
+# /bridge-* スレッド操作系コマンド
+# =========================================================
+
+def _check_thread_command(interaction: discord.Interaction) -> tuple[bool, discord.Thread | None]:
+    """スレッド内 + ALLOWED_USERS + フォーラムスレッドであることを確認。
+    OK なら (True, thread)、NG なら (False, None) を返す。
+    """
+    if str(interaction.user.id) not in ALLOWED_USERS:
+        return False, None
+    ch = interaction.channel
+    if not isinstance(ch, discord.Thread) or ch.parent_id != FORUM_CHANNEL_ID:
+        return False, None
+    return True, ch
+
+
+async def _reject_non_thread(interaction: discord.Interaction, ephemeral: bool = True):
+    if str(interaction.user.id) not in ALLOWED_USERS:
+        await interaction.response.send_message("権限がありません", ephemeral=True)
+        return
+    await interaction.response.send_message(
+        "このコマンドは bridge フォーラムのスレッド内で実行してください",
+        ephemeral=ephemeral,
+    )
+
+
+@bot.tree.command(name="bridge-info", description="このスレッドのセッション情報を表示する")
+async def cmd_info(interaction: discord.Interaction):
+    ok, thread = _check_thread_command(interaction)
+    if not ok:
+        await _reject_non_thread(interaction)
+        return
+    sid = await get_session_id(str(thread.id))
+    cwd_fixed = thread_cwds.get(thread.id)
+    derived_cwd = find_session_cwd(sid) if sid else None
+    cwd = cwd_fixed or derived_cwd or str(Path.home())
+    allowed = sorted(allowed_tools.get(str(thread.id), set()))
+    proc = get_thread_proc(thread.id)
+    running = "走行中" if proc and proc.poll() is None else "アイドル"
+    stats = usage_stats.get(thread.id) or {}
+    embed = discord.Embed(title="スレッド情報", color=discord.Color.blurple())
+    embed.add_field(name="セッションID", value=f"`{sid}`" if sid else "（無し）", inline=False)
+    embed.add_field(name="cwd", value=f"`{cwd}`" + (" (固定)" if cwd_fixed else ""), inline=False)
+    embed.add_field(name="状態", value=running, inline=True)
+    embed.add_field(name="ターン数", value=str(stats.get("turns", 0)), inline=True)
+    embed.add_field(name="常に許可済", value=", ".join(allowed) if allowed else "（無し）", inline=False)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="bridge-forget", description="このスレッドのセッションを破棄して次から新規開始する")
+async def cmd_forget(interaction: discord.Interaction):
+    ok, thread = _check_thread_command(interaction)
+    if not ok:
+        await _reject_non_thread(interaction)
+        return
+    thread_key = str(thread.id)
+    async with sessions_lock:
+        sessions = load_sessions()
+        old = sessions.pop(thread_key, None)
+        if old:
+            save_sessions(sessions)
+    if old:
+        await interaction.response.send_message(f"✅ セッション `{old}` を破棄しました。次のメッセージから新規開始します", ephemeral=True)
+    else:
+        await interaction.response.send_message("（このスレッドにはセッションがありません）", ephemeral=True)
+
+
+@bot.tree.command(name="bridge-cancel", description="このスレッドで走行中の claude を kill する")
+async def cmd_cancel(interaction: discord.Interaction):
+    ok, thread = _check_thread_command(interaction)
+    if not ok:
+        await _reject_non_thread(interaction)
+        return
+    proc = get_thread_proc(thread.id)
+    if proc is None or proc.poll() is not None:
+        await interaction.response.send_message("（走行中の claude はありません）", ephemeral=True)
+        return
+    try:
+        proc.kill()
+        await interaction.response.send_message("🛑 走行中の claude を kill しました", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"kill 失敗: {e}", ephemeral=True)
+
+
+@bot.tree.command(name="bridge-cwd", description="このスレッドの作業ディレクトリを固定する（空で固定解除）")
+@discord.app_commands.describe(path="絶対パス。空文字でクリア（自動推定に戻す）")
+async def cmd_cwd(interaction: discord.Interaction, path: str = ""):
+    ok, thread = _check_thread_command(interaction)
+    if not ok:
+        await _reject_non_thread(interaction)
+        return
+    p = path.strip()
+    if not p:
+        thread_cwds.pop(thread.id, None)
+        await interaction.response.send_message("🌿 cwd 固定を解除しました（自動推定に戻ります）", ephemeral=True)
+        return
+    if not os.path.isabs(p):
+        await interaction.response.send_message(f"❌ 絶対パスを指定してください: `{p}`", ephemeral=True)
+        return
+    if not os.path.isdir(p):
+        await interaction.response.send_message(f"❌ ディレクトリが存在しません: `{p}`", ephemeral=True)
+        return
+    thread_cwds[thread.id] = p
+    await interaction.response.send_message(f"📌 cwd を固定: `{p}`", ephemeral=True)
+
+
+@bot.tree.command(name="bridge-reset-perms", description="このスレッドで「常に許可」したツールを全クリアする")
+async def cmd_reset_perms(interaction: discord.Interaction):
+    ok, thread = _check_thread_command(interaction)
+    if not ok:
+        await _reject_non_thread(interaction)
+        return
+    removed = allowed_tools.pop(str(thread.id), set())
+    if removed:
+        await interaction.response.send_message(
+            f"🔒 クリアした「常に許可」: {', '.join(sorted(removed))}",
+            ephemeral=True,
+        )
+    else:
+        await interaction.response.send_message("（このスレッドに「常に許可」されたツールはありません）", ephemeral=True)
+
+
+@bot.tree.command(name="bridge-retry", description="直前のメッセージを再実行する")
+async def cmd_retry(interaction: discord.Interaction):
+    ok, thread = _check_thread_command(interaction)
+    if not ok:
+        await _reject_non_thread(interaction)
+        return
+    last = last_prompts.get(thread.id)
+    if not last:
+        await interaction.response.send_message("（このスレッドに直前メッセージの記録がありません）", ephemeral=True)
+        return
+    await interaction.response.send_message(f"🔁 再実行: {last[:200]}", ephemeral=True)
+    # 直前 prompt をそのままエンキュー
+    await enqueue_for_thread(thread, interaction, last)
+
+
+@bot.tree.command(name="bridge-usage", description="このスレッドの累積トークン/コストを表示する")
+async def cmd_usage(interaction: discord.Interaction):
+    ok, thread = _check_thread_command(interaction)
+    if not ok:
+        await _reject_non_thread(interaction)
+        return
+    s = usage_stats.get(thread.id)
+    if not s:
+        await interaction.response.send_message("（使用量データなし）", ephemeral=True)
+        return
+    embed = discord.Embed(title="スレッド使用量", color=discord.Color.gold())
+    embed.add_field(name="ターン数", value=str(s.get("turns", 0)), inline=True)
+    embed.add_field(name="累計コスト", value=f"${s.get('cost_usd', 0.0):.4f}", inline=True)
+    embed.add_field(name="入力トークン", value=f"{s.get('input_tokens', 0):,}", inline=True)
+    embed.add_field(name="出力トークン", value=f"{s.get('output_tokens', 0):,}", inline=True)
+    embed.add_field(name="cache_creation", value=f"{s.get('cache_creation_tokens', 0):,}", inline=True)
+    embed.add_field(name="cache_read", value=f"{s.get('cache_read_tokens', 0):,}", inline=True)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="bridge-archive", description="このスレッドをアーカイブする")
+async def cmd_archive(interaction: discord.Interaction):
+    ok, thread = _check_thread_command(interaction)
+    if not ok:
+        await _reject_non_thread(interaction)
+        return
+    try:
+        await interaction.response.send_message("📦 アーカイブします", ephemeral=True)
+        await thread.edit(archived=True)
+    except (discord.Forbidden, discord.HTTPException) as e:
+        await interaction.followup.send(f"アーカイブ失敗: {e}", ephemeral=True)
+
+
+@bot.tree.command(name="bridge-resume", description="セッションIDを指定してPCのClaude Codeセッションを引き継ぐ")
 @discord.app_commands.describe(
     session_id="Claude CodeのセッションID（claude --resume で使うやつ）",
     title="スレッドのタイトル（省略時は自動生成）",
