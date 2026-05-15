@@ -85,7 +85,7 @@ cp .env.example .env
 | `SKIP_PERMISSIONS` | 设为 `true` 自动允许所有操作（默认：`false`） |
 | `HOOK_PORT` | 权限请求内部端口（默认：`8585`） |
 | `CLAUDE_BIN` | `claude` 可执行文件名/路径（默认：`claude`） |
-| `PERMISSION_MODE` | `--permission-mode` 值（`acceptEdits` / `plan` / `auto` / `bypassPermissions` / 空） |
+| `PERMISSION_MODE` | `--permission-mode` 值（`default` / `acceptEdits` / `plan` / `auto` / `dontAsk` / `bypassPermissions` / 空） |
 | `MAX_TURNS` | 单次请求最大代理回合数（空 = 无限制） |
 | `MAX_BUDGET_USD` | 单次请求最大费用美元（空 = 无限制） |
 | `SOFT_TIMEOUT` / `HARD_TIMEOUT` | 进度通知 / 强制终止秒数（默认 600 / 3600） |

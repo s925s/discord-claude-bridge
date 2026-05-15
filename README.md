@@ -84,7 +84,7 @@ cp .env.example .env
 | `SKIP_PERMISSIONS` | `true` で全操作を自動許可（デフォルト: `false`） |
 | `HOOK_PORT` | 権限リクエスト用の内部ポート（デフォルト: `8585`） |
 | `CLAUDE_BIN` | `claude` 実行ファイル名/絶対パス（デフォルト: `claude`） |
-| `PERMISSION_MODE` | `--permission-mode` 値（`acceptEdits` / `plan` / `auto` / `bypassPermissions` / 空） |
+| `PERMISSION_MODE` | `--permission-mode` 値（`default` / `acceptEdits` / `plan` / `auto` / `dontAsk` / `bypassPermissions` / 空） |
 | `MAX_TURNS` | 1ターンの最大エージェント実行回数（空で無制限） |
 | `MAX_BUDGET_USD` | 1ターンの最大コスト USD（空で無制限） |
 | `SOFT_TIMEOUT` / `HARD_TIMEOUT` | 進捗通知 / 強制終了の秒数（既定 600 / 3600） |
